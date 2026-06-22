@@ -185,6 +185,12 @@ class Mapper:
         Positional ``mapper.integrate(obs)`` calls remain supported. The
         ``observation=`` keyword is retained as a deprecated alias; prefer
         ``camera_observation=`` and/or ``lidar_observation=`` for new code.
+        For geometry-only mapping, pass a cached all-zero ``uint8`` RGB image
+        with the same batch and image shape as the depth or range image. When
+        using lower-level configs that expose color resolution, keep
+        ``color_grid_size=1``. This keeps geometry-only and colored mapping on
+        the same path; local benchmarks showed color work is typically less
+        than 10% of integration time.
 
         Args:
             observation: Deprecated keyword alias for one camera or LiDAR observation.
