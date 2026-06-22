@@ -52,7 +52,7 @@ def extract_mesh_block_sparse(
     device = tsdf.device
     mc_tables = MCLookupTables.get(device)
     warp_data = tsdf.get_warp_data()
-    num_alloc = tsdf.data.num_allocated.item()
+    num_alloc = int(tsdf.data.num_allocated.item())
     kernels = tsdf.kernels
 
     empty_result = (
@@ -268,3 +268,169 @@ def extract_mesh_block_sparse(
     )
 
     return vertices, triangles, normals, colors
+
+
+def extract_approximate_mesh_block_sparse(
+    tsdf,
+    level: float = 0.0,
+    surface_only: bool = False,
+    minimum_tsdf_weight: float = 0.1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Extract an approximate triangle-soup mesh from a block-sparse TSDF.
+
+    This path emits one unique vertex per triangle corner. It avoids shared-edge
+    ownership, sorting, binary-search lookup, and invalid-edge filtering used by
+    :func:`extract_mesh_block_sparse`, trading compact topology for a faster
+    contiguous mesh layout that is suitable for realtime rendering.
+
+    Args:
+        tsdf: BlockSparseTSDF instance.
+        level: Isosurface level (typically 0.0).
+        surface_only: If True, only extract mesh near the surface.
+        minimum_tsdf_weight: Minimum weight to consider a voxel as observed.
+
+    Returns:
+        Tuple of (vertices, triangles, normals, colors).
+    """
+    device = tsdf.device
+    mc_tables = MCLookupTables.get(device)
+    warp_data = tsdf.get_warp_data()
+    num_alloc = int(tsdf.data.num_allocated.item())
+    kernels = tsdf.kernels
+
+    empty_result = (
+        torch.empty((0, 3), dtype=torch.float32, device=device),
+        torch.empty((0, 3), dtype=torch.int32, device=device),
+        torch.empty((0, 3), dtype=torch.float32, device=device),
+        torch.empty((0, 3), dtype=torch.uint8, device=device),
+    )
+
+    if num_alloc == 0:
+        return empty_result
+
+    surface_band = tsdf.config.truncation_distance if surface_only else 0.0
+
+    block_size = tsdf.block_size
+    block_voxels = block_size**3
+
+    active_count = torch.zeros(1, dtype=torch.int32, device=device)
+    active_block_idx = torch.empty(num_alloc, dtype=torch.int32, device=device)
+    wp_device, stream = get_warp_device_stream(active_count)
+
+    wp.launch(
+        kernels.append_active_blocks_kernel,
+        dim=num_alloc,
+        inputs=[
+            warp_data,
+            wp.from_torch(active_count, dtype=wp.int32),
+            wp.from_torch(active_block_idx, dtype=wp.int32),
+        ],
+        device=wp_device,
+        stream=stream,
+        adjoint=False,
+    )
+
+    n_active = int(active_count.item())
+    if n_active == 0:
+        return empty_result
+
+    active_block_idx = active_block_idx[:n_active]
+    surface_count = torch.zeros(1, dtype=torch.int32, device=device)
+
+    wp.launch(
+        kernels.count_surface_cubes_from_blocks_kernel,
+        dim=(n_active, block_voxels),
+        inputs=[
+            warp_data,
+            wp.from_torch(active_block_idx, dtype=wp.int32),
+            n_active,
+            level,
+            surface_band,
+            minimum_tsdf_weight,
+            wp.from_torch(surface_count, dtype=wp.int32),
+        ],
+        device=wp_device,
+        stream=stream,
+        adjoint=False,
+    )
+
+    n_surfaces = int(surface_count.item())
+    if n_surfaces == 0:
+        return empty_result
+
+    surface_block_idx = torch.zeros(n_surfaces, dtype=torch.int32, device=device)
+    surface_cube_idx = torch.zeros(n_surfaces, dtype=torch.int32, device=device)
+
+    surface_count.zero_()
+
+    wp.launch(
+        kernels.append_surface_cubes_from_blocks_kernel,
+        dim=(n_active, block_voxels),
+        inputs=[
+            warp_data,
+            wp.from_torch(active_block_idx, dtype=wp.int32),
+            n_active,
+            level,
+            surface_band,
+            minimum_tsdf_weight,
+            wp.from_torch(surface_count, dtype=wp.int32),
+            wp.from_torch(surface_block_idx, dtype=wp.int32),
+            wp.from_torch(surface_cube_idx, dtype=wp.int32),
+        ],
+        device=wp_device,
+        stream=stream,
+    )
+
+    triangle_count = torch.zeros(1, dtype=torch.int32, device=device)
+    wp.launch(
+        kernels.count_total_triangles_kernel,
+        dim=n_surfaces,
+        inputs=[
+            warp_data,
+            level,
+            minimum_tsdf_weight,
+            wp.from_torch(surface_block_idx, dtype=wp.int32),
+            wp.from_torch(surface_cube_idx, dtype=wp.int32),
+            n_surfaces,
+            mc_tables.num_tris_table,
+            wp.from_torch(triangle_count, dtype=wp.int32),
+        ],
+        device=wp_device,
+        stream=stream,
+    )
+
+    total_tris = int(triangle_count.item())
+
+    if total_tris == 0:
+        return empty_result
+
+    total_vertices = total_tris * 3
+    vertices = torch.zeros((total_vertices, 3), dtype=torch.float32, device=device)
+    normals = torch.zeros((total_vertices, 3), dtype=torch.float32, device=device)
+    colors = torch.zeros((total_vertices, 3), dtype=torch.uint8, device=device)
+    triangles_flat = torch.empty((total_vertices,), dtype=torch.int32, device=device)
+
+    triangle_count.zero_()
+    wp.launch(
+        kernels.generate_approximate_mesh_atomic_kernel,
+        dim=n_surfaces,
+        inputs=[
+            warp_data,
+            level,
+            minimum_tsdf_weight,
+            wp.from_torch(surface_block_idx, dtype=wp.int32),
+            wp.from_torch(surface_cube_idx, dtype=wp.int32),
+            n_surfaces,
+            mc_tables.tri_table,
+            wp.from_torch(vertices, dtype=wp.vec3),
+            wp.from_torch(triangles_flat, dtype=wp.int32),
+            wp.from_torch(normals, dtype=wp.vec3),
+            wp.from_torch(colors, dtype=wp.vec3ub),
+            wp.from_torch(triangle_count, dtype=wp.int32),
+            total_tris,
+        ],
+        device=wp_device,
+        stream=stream,
+    )
+
+    return vertices, triangles_flat.view(total_tris, 3), normals, colors

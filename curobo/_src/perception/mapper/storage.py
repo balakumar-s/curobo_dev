@@ -131,6 +131,13 @@ class BlockSparseTSDFCfg:
     #: Compile-time support-pixel capacity specialized into RGB and feature
     #: integration kernels. Must match the projective scratch depth.
     max_support_pixels_per_block_camera: int = 32
+    #: Enable a per-block local RGBW control grid. When disabled the mapper
+    #: uses the legacy one-RGBW-accumulator-per-block path.
+    use_color_grid: bool = False
+    #: Number of RGBW control points per block edge when ``use_color_grid`` is
+    #: enabled. Total storage is ``color_grid_size ** 3`` RGBW accumulators per
+    #: block.
+    color_grid_size: int = 1
     #: Upper bound on per-block accumulator weight (``block_rgb[:, 3]`` and
     #: ``block_feature_weight``) after each integration step. Caps the
     #: magnitude of the fp16 weighted-sum accumulators so they stay inside
@@ -169,6 +176,16 @@ class BlockSparseTSDFCfg:
             raise ValueError(
                 "max_support_pixels_per_block_camera must be positive, got "
                 f"{self.max_support_pixels_per_block_camera}."
+            )
+        if not isinstance(self.use_color_grid, bool):
+            raise ValueError(
+                "use_color_grid must be bool, got "
+                f"{type(self.use_color_grid).__name__}."
+            )
+        if self.color_grid_size <= 0:
+            raise ValueError(
+                "color_grid_size must be positive, got "
+                f"{self.color_grid_size}."
             )
         if self.max_blocks > DEFAULT_HASH_LAYOUT.max_pool_idx:
             raise ValueError(
@@ -363,6 +380,7 @@ class BlockSparseTSDFData:
     # Block pool - packed voxel data (3D for Warp INT32_MAX compatibility)
     block_data: torch.Tensor  # (max_blocks, block_size**3, 2) float16 or (1, 1, 2) dummy
     block_rgb: torch.Tensor  # (max_blocks, 4) float16 - per-block [R×w, G×w, B×w, W]
+    block_grid_rgb: torch.Tensor  # (max_blocks, color_grid_size**3, 4) fp16 or dummy
 
     # Per-block feature channel (weighted-sum accumulator + dedicated weight)
     block_features: torch.Tensor  # (max_blocks, feature_dim) float16 or (1, 1) dummy
@@ -409,7 +427,9 @@ class BlockSparseTSDFData:
     has_dynamic: bool = True
     has_static: bool = False
     has_features: bool = False
+    has_color_grid: bool = False
     feature_dim: int = 0
+    color_grid_size: int = 1
 
     def to_warp(self) -> BlockSparseTSDFWarp:
         """Convert to Warp struct for kernel launches.
@@ -429,6 +449,7 @@ class BlockSparseTSDFData:
         s.block_data = wp.from_torch(self.block_data, dtype=wp.float16)
         # Per-block weighted sums (fp16)
         s.block_rgb = wp.from_torch(self.block_rgb, dtype=wp.float16)
+        s.block_grid_rgb = wp.from_torch(self.block_grid_rgb, dtype=wp.float16)
 
         # Per-block feature channel (fp16 weighted sums, post-frame cap bounds magnitude)
         s.block_features = wp.from_torch(self.block_features, dtype=wp.float16)
@@ -441,7 +462,9 @@ class BlockSparseTSDFData:
         s.has_dynamic = self.has_dynamic
         s.has_static = self.has_static
         s.has_features = self.has_features
+        s.has_color_grid = self.has_color_grid
         s.feature_dim = self.feature_dim
+        s.color_grid_size = self.color_grid_size
 
         # Block metadata
         s.block_coords = wp.from_torch(self.block_coords, dtype=wp.int32)
@@ -605,6 +628,14 @@ class BlockSparseTSDF:
             "config.max_support_pixels_per_block_camera="
             f"{config.max_support_pixels_per_block_camera}"
         )
+        assert kernels.use_color_grid == config.use_color_grid, (
+            f"kernels.use_color_grid={kernels.use_color_grid} does not match "
+            f"config.use_color_grid={config.use_color_grid}"
+        )
+        assert kernels.color_grid_size == config.color_grid_size, (
+            f"kernels.color_grid_size={kernels.color_grid_size} does not match "
+            f"config.color_grid_size={config.color_grid_size}"
+        )
         assert kernels.hash_layout == DEFAULT_HASH_LAYOUT, (
             f"kernels.hash_layout={kernels.hash_layout} does not match "
             f"DEFAULT_HASH_LAYOUT={DEFAULT_HASH_LAYOUT}"
@@ -671,6 +702,20 @@ class BlockSparseTSDF:
                 device=self.device,
             )
 
+        color_grid_voxels = config.color_grid_size**3
+        if config.use_color_grid:
+            block_grid_rgb = torch.zeros(
+                (config.max_blocks, color_grid_voxels, 4),
+                dtype=torch.float16,
+                device=self.device,
+            )
+        else:
+            block_grid_rgb = torch.zeros(
+                (1, 1, 4),
+                dtype=torch.float16,
+                device=self.device,
+            )
+
         # Pre-allocate all tensors
         self._data = BlockSparseTSDFData(
             # Hash table (packed key+value, -1 = empty)
@@ -693,6 +738,9 @@ class BlockSparseTSDF:
                 dtype=torch.float16,
                 device=self.device,
             ),
+            # Optional per-block local RGBW control lattice. Kept separate
+            # from block_rgb so legacy block-color behavior remains available.
+            block_grid_rgb=block_grid_rgb,
             # Per-block feature channel (conditional). feature_dim==0 gives
             # (1, 1) / (1,) dummies so the Warp struct can always be built.
             block_features=block_features,
@@ -764,7 +812,9 @@ class BlockSparseTSDF:
             has_dynamic=config.enable_dynamic,
             has_static=config.enable_static,
             has_features=has_features,
+            has_color_grid=config.use_color_grid,
             feature_dim=config.feature_dim,
+            color_grid_size=config.color_grid_size,
         )
 
         # Cached Warp struct (for CUDA graph compatibility)
@@ -848,7 +898,7 @@ class BlockSparseTSDF:
         if self._data.has_static:
             self._data.static_block_data.fill_(float("inf"))
 
-        # Note: block_data and block_rgb are cleared lazily when blocks
+        # Note: block_data, block_rgb, and block_grid_rgb are cleared lazily when blocks
         # are allocated (via clear_new_blocks_kernel)
 
     def export_blocks(self) -> Dict[str, torch.Tensor]:
@@ -1143,6 +1193,7 @@ class BlockSparseTSDF:
         total += self._data.hash_table.numel() * 8  # int64 (packed key+value)
         total += self._data.block_data.numel() * 2  # float16
         total += self._data.block_rgb.numel() * 2  # float16
+        total += self._data.block_grid_rgb.numel() * 2  # float16
         total += self._data.block_features.numel() * 2  # float16
         total += self._data.block_feature_weight.numel() * 2  # float16
         total += self._data.static_block_data.numel() * 2  # float16

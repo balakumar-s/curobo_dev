@@ -66,6 +66,9 @@ class BlockSparseKernels:
     max_feature_tile_channels: int
     max_support_pixels_per_block_camera: int
     max_support_pixels_per_block_lidar: int
+    use_color_grid: bool
+    color_grid_size: int
+    color_grid_voxels: int
     hash_layout: HashLayout
 
     pack_entry: WarpFunction
@@ -90,6 +93,7 @@ class BlockSparseKernels:
     unpack_block_key: WarpFunction
     clear_new_blocks_kernel: WarpKernel
     clear_new_block_features_kernel: WarpKernel
+    clear_new_block_grid_rgb_kernel: WarpKernel
 
     world_to_continuous_voxel: WarpFunction
     voxel_to_world: WarpFunction
@@ -136,14 +140,26 @@ class BlockSparseKernels:
     extract_surface_voxels_kernel: WarpKernel
 
     count_surface_cubes_kernel: WarpKernel
+    append_active_blocks_kernel: WarpKernel
+    count_surface_cubes_from_blocks_kernel: WarpKernel
     append_surface_cubes_kernel: WarpKernel
+    append_surface_cubes_from_blocks_kernel: WarpKernel
     count_edges_block_sparse_kernel: WarpKernel
     generate_vertices_block_sparse_kernel: WarpKernel
     generate_triangles_shared_kernel: WarpKernel
     count_triangles_kernel: WarpKernel
+    count_total_triangles_kernel: WarpKernel
+    generate_approximate_mesh_block_sparse_kernel: WarpKernel
+    generate_approximate_mesh_atomic_kernel: WarpKernel
+    generate_approximate_mesh_current_state_kernel: WarpKernel
+    count_fast_mesh_block_triangles_kernel: WarpKernel
+    generate_fast_mesh_current_state_kernel: WarpKernel
+    copy_rgb_images_to_texture_atlas_kernel: WarpKernel
+    project_fast_mesh_uvs_kernel: WarpKernel
     sample_vertex_colors_kernel: WarpKernel
 
     rescale_block_accumulators_kernel: WarpKernel
+    rescale_block_grid_rgb_kernel: WarpKernel
 
     compute_block_keys_only_kernel: WarpKernel
     allocate_visible_blocks_from_keys_kernel: WarpKernel
@@ -151,8 +167,10 @@ class BlockSparseKernels:
     collect_blocks_in_aabb_kernel: WarpKernel
     clear_blocks_by_pool_kernel: WarpKernel
     clear_block_features_by_pool_kernel: WarpKernel
+    clear_block_grid_rgb_by_pool_kernel: WarpKernel
     integrate_voxels_kernel: WarpKernel
     integrate_block_rgb_from_support_kernel: WarpKernel
+    integrate_block_grid_rgb_kernel: WarpKernel
     integrate_features_from_support_grouped_kernel: WarpKernel
     integrate_features_from_support_tiled_kernel: WarpKernel
     # Backward-compatible aliases for callers/tests that still look up the
@@ -215,6 +233,17 @@ def _resolve_positive_int_attr(cfg: Any | None, name: str, default: int) -> int:
     if value is None:
         return default
     return int(value)
+
+
+def _resolve_bool_attr(cfg: Any | None, name: str, default: bool) -> bool:
+    if cfg is None or isinstance(cfg, int):
+        return default
+    value = getattr(cfg, name, default)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        log_and_raise(f"{name} must be bool, got {type(value).__name__}.")
+    return bool(value)
 
 
 def _resolve_optional_positive_int_attr(cfg: Any | None, name: str) -> int | None:
@@ -341,6 +370,9 @@ def make_block_sparse_kernels(
     resolved_lidar_num_sensors = _resolve_positive_int_attr(cfg, "lidar_num_sensors", 0)
     resolved_lidar_image_height = _resolve_optional_positive_int_attr(cfg, "lidar_image_height")
     resolved_lidar_image_width = _resolve_optional_positive_int_attr(cfg, "lidar_image_width")
+    resolved_use_color_grid = _resolve_bool_attr(cfg, "use_color_grid", False)
+    resolved_color_grid_size = _resolve_positive_int_attr(cfg, "color_grid_size", 1)
+    resolved_color_grid_voxels = resolved_color_grid_size**3
     resolved_grid_shape = _resolve_grid_shape(cfg)
     resolved_esdf_grid_shape = _resolve_esdf_grid_shape(cfg)
     resolved_origin_xyz = _resolve_origin_xyz(cfg)
@@ -367,6 +399,8 @@ def make_block_sparse_kernels(
         )
     if resolved_num_samples <= 0:
         log_and_raise(f"num_samples must be > 0, got {resolved_num_samples}.")
+    if resolved_color_grid_size <= 0:
+        log_and_raise(f"color_grid_size must be > 0, got {resolved_color_grid_size}.")
     if resolved_voxel_size <= 0.0:
         log_and_raise(f"voxel_size must be > 0, got {resolved_voxel_size}.")
     if resolved_truncation_distance < 0.0:
@@ -464,21 +498,30 @@ def make_block_sparse_kernels(
         world_to_block_coords=coord_exports["world_to_block_coords"],
         world_to_block_and_local=coord_exports["world_to_block_and_local"],
         world_to_continuous_voxel=coord_exports["world_to_continuous_voxel"],
+        use_color_grid=resolved_use_color_grid,
+        color_grid_size=resolved_color_grid_size,
     )
     mesh_exports = make_mesh_kernels(
         resolved_block_size,
+        num_cameras=resolved_num_cameras,
+        image_height=resolved_image_height,
+        image_width=resolved_image_width,
         hash_lookup=hash_exports["hash_lookup"],
         compute_avg_rgb_uint8_from_block=hash_exports["compute_avg_rgb_uint8_from_block"],
+        sample_rgb=raycast_exports["sample_rgb"],
         sample_voxel=raycast_exports["sample_voxel"],
         sample_tsdf_trilinear=raycast_exports["sample_tsdf_trilinear"],
         compute_gradient=raycast_exports["compute_gradient"],
         compute_gradient_nearest=raycast_exports["compute_gradient_nearest"],
         block_grid_to_key_coords=coord_exports["block_grid_to_key_coords"],
         block_key_to_voxel_base=coord_exports["block_key_to_voxel_base"],
+        use_color_grid=resolved_use_color_grid,
     )
     rescale_exports = make_rescale_kernels(
         resolved_block_size,
         feature_dim=resolved_feature_dim,
+        use_color_grid=resolved_use_color_grid,
+        color_grid_size=resolved_color_grid_size,
     )
     integrate_exports = make_camera_integrate_kernels(
         resolved_block_size,
@@ -495,6 +538,8 @@ def make_block_sparse_kernels(
         feature_channels_per_thread=feature_channels_per_thread,
         max_feature_tile_channels=resolved_max_feature_tile_channels,
         max_support_pixels_per_block_camera=resolved_max_support_pixels_per_block_camera,
+        use_color_grid=resolved_use_color_grid,
+        color_grid_size=resolved_color_grid_size,
         pack_key_only=hash_exports["pack_key_only"],
         unpack_block_key=hash_exports["unpack_block_key"],
         find_or_insert_block=hash_exports["find_or_insert_block"],
@@ -505,6 +550,7 @@ def make_block_sparse_kernels(
         block_local_to_world=coord_exports["block_local_to_world"],
         block_grid_to_key_coords=coord_exports["block_grid_to_key_coords"],
         block_key_to_grid_coords=coord_exports["block_key_to_grid_coords"],
+        block_key_to_voxel_base=coord_exports["block_key_to_voxel_base"],
     )
     lidar_integrate_exports = make_lidar_integrate_kernels(
         resolved_block_size,
@@ -561,6 +607,9 @@ def make_block_sparse_kernels(
         max_feature_tile_channels=resolved_max_feature_tile_channels,
         max_support_pixels_per_block_camera=resolved_max_support_pixels_per_block_camera,
         max_support_pixels_per_block_lidar=resolved_max_support_pixels_per_block_lidar,
+        use_color_grid=resolved_use_color_grid,
+        color_grid_size=resolved_color_grid_size,
+        color_grid_voxels=resolved_color_grid_voxels,
         hash_layout=hash_layout,
         **hash_exports,
         **coord_exports,

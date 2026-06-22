@@ -31,9 +31,19 @@ import warp as wp
 from curobo._src.util.warp import warp_kernel
 
 
-def make_rescale_kernels(block_size: int, *, feature_dim: int) -> dict[str, object]:
+def make_rescale_kernels(
+    block_size: int,
+    *,
+    feature_dim: int,
+    use_color_grid: bool = False,
+    color_grid_size: int = 1,
+) -> dict[str, object]:
     """Build per-block accumulator rescale kernels."""
     FEATURE_DIM = wp.constant(wp.int32(feature_dim))
+    USE_COLOR_GRID = wp.constant(bool(use_color_grid))
+    color_grid_voxels = int(color_grid_size) ** 3
+    COLOR_GRID_VOXELS = wp.constant(wp.int32(color_grid_voxels))
+    COLOR_GRID_RGB_CELLS = wp.constant(wp.int32(color_grid_voxels * 3))
 
     @warp_kernel(f"rescale_block_accumulators_kernel_bs{block_size}_fd{feature_dim}")
     def rescale_block_accumulators_kernel(
@@ -85,6 +95,40 @@ def make_rescale_kernels(block_size: int, *, feature_dim: int) -> dict[str, obje
                 if ch == 0:
                     block_rgb[pool_idx, 3] = wp.float16(w_max)
 
+    @warp_kernel(
+        f"rescale_block_grid_rgb_kernel_bs{block_size}_cg{int(use_color_grid)}_gs{color_grid_size}"
+    )
+    def rescale_block_grid_rgb_kernel(
+        visible_pool_indices: wp.array(dtype=wp.int32),
+        n_visible: wp.int32,
+        w_max: wp.float32,
+        block_grid_rgb: wp.array3d(dtype=wp.float16),
+    ):
+        """Cap per-node RGB grid weights at ``w_max`` while preserving means."""
+        vis_idx, cell_idx = wp.tid()
+        if vis_idx >= n_visible or cell_idx >= COLOR_GRID_RGB_CELLS:
+            return
+        if not USE_COLOR_GRID:
+            return
+
+        pool_idx = visible_pool_indices[vis_idx]
+        if pool_idx < 0:
+            return
+
+        node_idx = cell_idx // wp.int32(3)
+        ch = cell_idx - node_idx * wp.int32(3)
+        if node_idx >= COLOR_GRID_VOXELS:
+            return
+
+        rgb_weight = wp.float32(block_grid_rgb[pool_idx, node_idx, 3])
+        if rgb_weight > w_max:
+            current_rgb = wp.float32(block_grid_rgb[pool_idx, node_idx, ch])
+            s = w_max / rgb_weight
+            block_grid_rgb[pool_idx, node_idx, ch] = wp.float16(current_rgb * s)
+            if ch == wp.int32(0):
+                block_grid_rgb[pool_idx, node_idx, 3] = wp.float16(w_max)
+
     return {
         "rescale_block_accumulators_kernel": rescale_block_accumulators_kernel,
+        "rescale_block_grid_rgb_kernel": rescale_block_grid_rgb_kernel,
     }

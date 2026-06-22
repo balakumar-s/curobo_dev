@@ -49,6 +49,10 @@ class BlockSparseTSDFWarp:
             inside finite range and per-atomic ulp loss stays bounded.
             Access: ``block_rgb[pool_idx, 0/1/2/3]``.
 
+        block_grid_rgb: (max_blocks, COLOR_GRID_SIZE**3, 4) float16
+            Optional per-block local RGBW control grid. Disabled configs pass
+            a dummy ``(1, 1, 4)`` tensor and ``has_color_grid=False``.
+
         block_coords: (max_blocks * 3,) int32
             Signed centered hash block keys: [bx, by, bz] for each block.
             Access: ``bx = block_coords[pool_idx * 3 + 0]``.
@@ -68,6 +72,7 @@ class BlockSparseTSDFWarp:
     # Block pool - dynamic channel (depth integration)
     block_data: wp.array3d(dtype=wp.float16)  # (max_blocks, BLOCK_SIZE**3, 2) or (1, 1, 2) dummy
     block_rgb: wp.array2d(dtype=wp.float16)  # (max_blocks, 4) per-block [R*w, G*w, B*w, W]
+    block_grid_rgb: wp.array3d(dtype=wp.float16)  # (max_blocks, color_grid_size**3, 4) or dummy
 
     # Per-block feature channel (fp16 weighted sums + dedicated weight)
     block_features: wp.array2d(dtype=wp.float16)  # (max_blocks, feature_dim) or (1, 1) dummy
@@ -80,7 +85,9 @@ class BlockSparseTSDFWarp:
     has_dynamic: wp.bool  # True if dynamic channel is enabled
     has_static: wp.bool  # True if static channel is enabled
     has_features: wp.bool  # True if per-block feature channel is enabled
+    has_color_grid: wp.bool  # True if per-block color grid is enabled
     feature_dim: int  # 0 when the feature channel is disabled
+    color_grid_size: int  # 1 when color grid is disabled
 
     # Block metadata
     block_coords: wp.array(dtype=wp.int32)  # (max_blocks * 3,) signed block keys

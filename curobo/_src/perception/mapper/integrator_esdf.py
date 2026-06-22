@@ -191,6 +191,10 @@ class BlockSparseESDFIntegratorCfg:
     #: Compile-time cap for feature channels accumulated by one tiled
     #: feature-kernel CTA.
     max_feature_tile_channels: int = 4096
+    #: Enable a per-block local RGBW control grid for stored color.
+    use_color_grid: bool = False
+    #: Number of RGBW control points per block edge when ``use_color_grid`` is enabled.
+    color_grid_size: int = 1
     #: Feature integration launch policy: ``"auto"``, ``"grouped"``, or
     #: ``"tiled"``. Resolved by the TSDF integrator to the low-level launch bool.
     feature_integration_kernel: str = "auto"
@@ -286,6 +290,15 @@ class BlockSparseESDFIntegratorCfg:
             log_and_raise(
                 "max_support_pixels_per_block_camera must be positive: "
                 f"{self.max_support_pixels_per_block_camera}"
+            )
+        if not isinstance(self.use_color_grid, bool):
+            log_and_raise(
+                "use_color_grid must be bool, got "
+                f"{type(self.use_color_grid).__name__}."
+            )
+        if self.color_grid_size <= 0:
+            log_and_raise(
+                f"color_grid_size must be positive, got color_grid_size={self.color_grid_size}."
             )
         _validate_feature_integration_kernel(self.feature_integration_kernel)
         if not isinstance(self.profile_integration_kernel_timings, bool):
@@ -387,6 +400,8 @@ class BlockSparseESDFIntegrator:
             max_support_pixels_per_block_camera=config.max_support_pixels_per_block_camera,
             feature_channels_per_thread=config.feature_channels_per_thread,
             max_feature_tile_channels=config.max_feature_tile_channels,
+            use_color_grid=config.use_color_grid,
+            color_grid_size=config.color_grid_size,
             feature_integration_kernel=config.feature_integration_kernel,
             profile_integration_kernel_timings=config.profile_integration_kernel_timings,
             accumulator_w_max=config.accumulator_w_max,
@@ -709,6 +724,7 @@ class BlockSparseESDFIntegrator:
         refine_iterations: int = 2,
         surface_only: bool = True,
         level: float = 0.0,
+        approximate: bool = False,
     ) -> Mesh:
         """Extract mesh using GPU marching cubes.
 
@@ -716,6 +732,8 @@ class BlockSparseESDFIntegrator:
             refine_iterations: Newton-Raphson iterations for vertex refinement.
             surface_only: Only extract mesh near surface (|sdf| < truncation).
             level: Isosurface level (typically 0.0).
+            approximate: If True, use the approximate triangle-soup extractor
+                instead of the shared-vertex extractor.
 
         Returns:
             Mesh object with vertices, faces, and colors.
@@ -724,6 +742,7 @@ class BlockSparseESDFIntegrator:
             level=level,
             refine_iterations=refine_iterations,
             surface_only=surface_only,
+            approximate=approximate,
         )
 
         return mesh

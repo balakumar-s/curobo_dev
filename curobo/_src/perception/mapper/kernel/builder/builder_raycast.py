@@ -45,9 +45,13 @@ def make_raycast_kernels(
     world_to_block_coords,
     world_to_block_and_local,
     world_to_continuous_voxel,
+    use_color_grid: bool = False,
+    color_grid_size: int = 1,
 ) -> dict[str, object]:
     """Build raycast and voxel-extraction kernels."""
     BS = wp.constant(block_size)
+    USE_COLOR_GRID = wp.constant(bool(use_color_grid))
+    COLOR_GRID_SIZE = wp.constant(wp.int32(color_grid_size))
 
     # Cross-domain helpers are explicit parameters so Warp sees them as
     # local closure bindings when compiling dependent functions.
@@ -257,12 +261,60 @@ def make_raycast_kernels(
         )
         return wp.vec2(sdf, 1.0)
 
-    @warp_func(f"sample_rgb_bs{block_size}")
+    @warp_func(f"sample_block_grid_rgb_bs{block_size}_cg{int(use_color_grid)}_gs{color_grid_size}")
+    def sample_block_grid_rgb(
+        tsdf: BlockSparseTSDFWarp,
+        world_pos: wp.vec3,
+        pool_idx: wp.int32,
+        bx: wp.int32,
+        by: wp.int32,
+        bz: wp.int32,
+    ) -> wp.vec4:
+        """Sample weighted RGBW from the optional per-block RGB grid."""
+        if not USE_COLOR_GRID:
+            return wp.vec4(0.0, 0.0, 0.0, 0.0)
+
+        base = block_key_to_voxel_base(bx, by, bz)
+        voxel_f = world_to_continuous_voxel(world_pos)
+        local_x = voxel_f[0] - wp.float32(base[0])
+        local_y = voxel_f[1] - wp.float32(base[1])
+        local_z = voxel_f[2] - wp.float32(base[2])
+
+        if COLOR_GRID_SIZE <= wp.int32(1) or BS <= wp.int32(1):
+            return wp.vec4(
+                wp.float32(tsdf.block_grid_rgb[pool_idx, 0, 0]),
+                wp.float32(tsdf.block_grid_rgb[pool_idx, 0, 1]),
+                wp.float32(tsdf.block_grid_rgb[pool_idx, 0, 2]),
+                wp.float32(tsdf.block_grid_rgb[pool_idx, 0, 3]),
+            )
+
+        grid_max = wp.float32(COLOR_GRID_SIZE - wp.int32(1))
+        scale = grid_max / wp.float32(BS - wp.int32(1))
+        gx_f = wp.clamp((local_x - wp.float32(0.5)) * scale, wp.float32(0.0), grid_max)
+        gy_f = wp.clamp((local_y - wp.float32(0.5)) * scale, wp.float32(0.0), grid_max)
+        gz_f = wp.clamp((local_z - wp.float32(0.5)) * scale, wp.float32(0.0), grid_max)
+
+        gx = wp.int32(wp.floor(gx_f + wp.float32(0.5)))
+        gy = wp.int32(wp.floor(gy_f + wp.float32(0.5)))
+        gz = wp.int32(wp.floor(gz_f + wp.float32(0.5)))
+        gx = wp.min(wp.max(gx, wp.int32(0)), COLOR_GRID_SIZE - wp.int32(1))
+        gy = wp.min(wp.max(gy, wp.int32(0)), COLOR_GRID_SIZE - wp.int32(1))
+        gz = wp.min(wp.max(gz, wp.int32(0)), COLOR_GRID_SIZE - wp.int32(1))
+        stride_z = COLOR_GRID_SIZE * COLOR_GRID_SIZE
+        idx = gz * stride_z + gy * COLOR_GRID_SIZE + gx
+        return wp.vec4(
+            wp.float32(tsdf.block_grid_rgb[pool_idx, idx, 0]),
+            wp.float32(tsdf.block_grid_rgb[pool_idx, idx, 1]),
+            wp.float32(tsdf.block_grid_rgb[pool_idx, idx, 2]),
+            wp.float32(tsdf.block_grid_rgb[pool_idx, idx, 3]),
+        )
+
+    @warp_func(f"sample_rgb_bs{block_size}_cg{int(use_color_grid)}_gs{color_grid_size}")
     def sample_rgb(
         tsdf: BlockSparseTSDFWarp,
         world_pos: wp.vec3,
     ) -> wp.vec3:
-        """Sample RGB color from TSDF struct (per-block average)."""
+        """Sample RGB color from grid RGB when enabled, else per-block average."""
         coords = world_to_block_and_local(world_pos)
         bx = coords[0]
         by = coords[1]
@@ -271,6 +323,17 @@ def make_raycast_kernels(
         pool_idx = hash_lookup(tsdf.hash_table, bx, by, bz, tsdf.hash_capacity)
         if pool_idx < 0:
             return wp.vec3(0.0, 0.0, 0.0)
+
+        if USE_COLOR_GRID:
+            grid_rgbw = sample_block_grid_rgb(tsdf, world_pos, pool_idx, bx, by, bz)
+            grid_w = grid_rgbw[3]
+            if grid_w > wp.float32(1.0e-6):
+                inv_w = wp.float32(255.0) / grid_w
+                return wp.vec3(
+                    wp.clamp(grid_rgbw[0] * inv_w, wp.float32(0.0), wp.float32(255.0)),
+                    wp.clamp(grid_rgbw[1] * inv_w, wp.float32(0.0), wp.float32(255.0)),
+                    wp.clamp(grid_rgbw[2] * inv_w, wp.float32(0.0), wp.float32(255.0)),
+                )
 
         return compute_avg_rgb_from_block(tsdf.block_rgb, pool_idx)
 

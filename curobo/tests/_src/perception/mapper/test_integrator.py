@@ -261,6 +261,19 @@ class TestBlockSparseTSDFIntegrator:
         assert normals.dtype == torch.float32
         assert colors.dtype == torch.uint8
 
+        vertices, triangles, normals, colors = integrator.extract_mesh_tensors(approximate=True)
+
+        assert vertices.dtype == torch.float32
+        assert triangles.dtype == torch.int32
+        assert normals.dtype == torch.float32
+        assert colors.dtype == torch.uint8
+        if triangles.shape[0] > 0:
+            assert vertices.shape[0] == triangles.shape[0] * 3
+            assert torch.equal(
+                triangles.reshape(-1),
+                torch.arange(vertices.shape[0], dtype=torch.int32, device=device),
+            )
+
     def test_reset(self, warp_init, device):
         """Test integrator reset."""
         config = BlockSparseTSDFIntegratorCfg(

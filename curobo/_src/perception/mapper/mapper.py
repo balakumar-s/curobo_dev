@@ -300,12 +300,15 @@ class Mapper:
         self,
         refine_iterations: int = 2,
         surface_only: bool = True,
+        approximate: bool = False,
     ) -> Mesh:
         """Extract mesh using GPU marching cubes.
 
         Args:
             refine_iterations: Newton-Raphson iterations for vertex refinement.
             surface_only: Only extract mesh near surface.
+            approximate: If True, use the approximate triangle-soup extractor
+                instead of the shared-vertex extractor.
 
         Returns:
             Mesh object with vertices, faces, and colors.
@@ -313,6 +316,7 @@ class Mapper:
         return self._integrator.extract_mesh(
             refine_iterations=refine_iterations,
             surface_only=surface_only,
+            approximate=approximate,
         )
 
     def extract_occupied_voxels(

@@ -12,6 +12,7 @@ from curobo._src.perception.mapper.integrator_tsdf import (
     BlockSparseTSDFIntegratorCfg,
 )
 from curobo._src.perception.mapper.mesh_extractor import (
+    extract_approximate_mesh_block_sparse,
     extract_mesh_block_sparse,
 )
 from curobo._src.util.warp import init_warp
@@ -79,6 +80,13 @@ class TestMarchingCubes:
         assert triangles.shape == (0, 3)
         assert colors.shape == (0, 3)
 
+        vertices, triangles, normals, colors = extract_approximate_mesh_block_sparse(tsdf)
+
+        assert vertices.shape == (0, 3)
+        assert triangles.shape == (0, 3)
+        assert normals.shape == (0, 3)
+        assert colors.shape == (0, 3)
+
     def test_flat_plane_creates_mesh(self, warp_init, device, simple_intrinsics, identity_pose):
         """Test that a flat depth plane creates a mesh."""
         # Use larger voxels and truncation to ensure dense sampling
@@ -118,6 +126,46 @@ class TestMarchingCubes:
         assert not torch.isnan(vertices).any(), "Vertices should not contain NaN"
 
         # Check triangles reference valid vertices
+        assert triangles.min() >= 0
+        assert triangles.max() < vertices.shape[0]
+
+    def test_approximate_mesh_triangle_soup(
+        self, warp_init, device, simple_intrinsics, identity_pose
+    ):
+        """Test that approximate extraction emits identity-indexed triangle soup."""
+        config = BlockSparseTSDFIntegratorCfg(
+            max_blocks=2000,
+            voxel_size=0.02,
+            origin=torch.tensor([-0.5, -0.5, 0.0]),
+            grid_shape=(512, 512, 512),
+            truncation_distance=0.1,
+            device=device,
+            image_height=200,
+            image_width=200,
+        )
+        integrator = BlockSparseTSDFIntegrator(config)
+        tsdf = integrator.tsdf
+
+        depth = torch.full((200, 200), 1.0, dtype=torch.float32, device=device)
+        rgb = torch.full((200, 200, 3), 200, dtype=torch.uint8, device=device)
+        position, quaternion = identity_pose
+        obs = make_observation(depth, rgb, position, quaternion, simple_intrinsics)
+        for _ in range(10):
+            integrator.integrate(obs)
+
+        vertices, triangles, normals, colors = extract_approximate_mesh_block_sparse(tsdf)
+
+        assert vertices.shape[0] > 0
+        assert triangles.shape[0] > 0
+        assert vertices.shape[0] == triangles.shape[0] * 3
+        assert normals.shape == vertices.shape
+        assert colors.shape == vertices.shape
+        assert triangles.dtype == torch.int32
+        assert torch.equal(
+            triangles.reshape(-1),
+            torch.arange(vertices.shape[0], dtype=torch.int32, device=device),
+        )
+        assert not torch.isnan(vertices).any()
         assert triangles.min() >= 0
         assert triangles.max() < vertices.shape[0]
 

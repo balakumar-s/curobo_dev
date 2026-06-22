@@ -66,6 +66,7 @@ from curobo._src.perception.mapper.kernel.wp_voxel_extraction import (
     extract_surface_voxels_block_sparse,
 )
 from curobo._src.perception.mapper.mesh_extractor import (
+    extract_approximate_mesh_block_sparse,
     extract_mesh_block_sparse,
 )
 from curobo._src.perception.mapper.storage import (
@@ -165,6 +166,12 @@ class BlockSparseTSDFIntegratorCfg:
     #: Compile-time cap for feature channels accumulated by one tiled
     #: feature-kernel CTA.
     max_feature_tile_channels: int = 4096
+    #: Enable a per-block local RGBW control grid. This keeps legacy block RGB
+    #: available while allowing larger block sizes to retain spatial color.
+    use_color_grid: bool = False
+    #: Number of RGBW control points per block edge when ``use_color_grid`` is
+    #: enabled. Total controls per block are ``color_grid_size ** 3``.
+    color_grid_size: int = 1
     #: Feature integration launch policy: ``"auto"``, ``"grouped"``, or
     #: ``"tiled"``. Resolved to a low-level tiled bool at construction time.
     feature_integration_kernel: str = "auto"
@@ -284,6 +291,15 @@ class BlockSparseTSDFIntegratorCfg:
                 f"max_support_pixels_per_block_camera="
                 f"{self.max_support_pixels_per_block_camera}."
             )
+        if not isinstance(self.use_color_grid, bool):
+            log_and_raise(
+                "use_color_grid must be bool, got "
+                f"{type(self.use_color_grid).__name__}."
+            )
+        if self.color_grid_size <= 0:
+            log_and_raise(
+                f"color_grid_size must be positive, got color_grid_size={self.color_grid_size}."
+            )
         _validate_feature_integration_kernel(self.feature_integration_kernel)
         if not isinstance(self.profile_integration_kernel_timings, bool):
             log_and_raise(
@@ -364,6 +380,8 @@ class BlockSparseTSDFIntegrator:
             feature_channels_per_thread=config.feature_channels_per_thread,
             max_feature_tile_channels=config.max_feature_tile_channels,
             max_support_pixels_per_block_camera=config.max_support_pixels_per_block_camera,
+            use_color_grid=config.use_color_grid,
+            color_grid_size=config.color_grid_size,
             accumulator_w_max=config.accumulator_w_max,
         )
         if kernels is None:
@@ -875,6 +893,7 @@ class BlockSparseTSDFIntegrator:
         refine_iterations: int = 2,
         surface_only: bool = False,
         level: float = 0.0,
+        approximate: bool = False,
     ) -> Mesh:
         """Extract mesh from the TSDF using marching cubes.
 
@@ -886,23 +905,35 @@ class BlockSparseTSDFIntegrator:
                 Excludes triangles from regions deep inside the object where TSDF
                 is clamped to -truncation_distance.
             level: Isosurface level (typically 0.0).
+            approximate: If True, use the approximate triangle-soup extractor
+                instead of the shared-vertex extractor.
 
 
         Returns:
             Mesh object with vertices, triangles, normals, and colors.
         """
-        vertices, triangles, normals, colors = extract_mesh_block_sparse(
-            self._tsdf,
-            level=level,
-            surface_only=surface_only,
-            refine_iterations=refine_iterations,
-            minimum_tsdf_weight=self.config.minimum_tsdf_weight,
-        )
+        if approximate:
+            vertices, triangles, normals, colors = extract_approximate_mesh_block_sparse(
+                self._tsdf,
+                level=level,
+                surface_only=surface_only,
+                minimum_tsdf_weight=self.config.minimum_tsdf_weight,
+            )
+        else:
+            vertices, triangles, normals, colors = extract_mesh_block_sparse(
+                self._tsdf,
+                level=level,
+                surface_only=surface_only,
+                refine_iterations=refine_iterations,
+                minimum_tsdf_weight=self.config.minimum_tsdf_weight,
+            )
 
         # Convert tensors to lists for Mesh class
         # faces should be (N, 3) for trimesh compatibility
         return Mesh(
-            name="block_sparse_tsdf_mesh",
+            name="block_sparse_tsdf_approximate_mesh"
+            if approximate
+            else "block_sparse_tsdf_mesh",
             vertices=vertices,  # .cpu().tolist(),
             faces=triangles,  # .cpu().tolist(),  # Keep as (N, 3), not flattened
             vertex_colors=(colors.float() / 255.0),  # .cpu().tolist(),
@@ -914,6 +945,7 @@ class BlockSparseTSDFIntegrator:
         level: float = 0.0,
         surface_only: bool = False,
         refine_iterations: int = 0,
+        approximate: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Extract mesh as raw tensors.
 
@@ -925,6 +957,8 @@ class BlockSparseTSDFIntegrator:
             refine_iterations: Number of Newton-Raphson iterations for vertex refinement.
                 0 = no refinement (linear interpolation only). Higher values (2-5)
                 produce smoother meshes at the cost of more computation.
+            approximate: If True, use the approximate triangle-soup extractor
+                instead of the shared-vertex extractor.
 
         Returns:
             Tuple of (vertices, triangles, normals, colors):
@@ -933,6 +967,13 @@ class BlockSparseTSDFIntegrator:
                 - normals: (N, 3) float32
                 - colors: (N, 3) uint8
         """
+        if approximate:
+            return extract_approximate_mesh_block_sparse(
+                self._tsdf,
+                level=level,
+                surface_only=surface_only,
+                minimum_tsdf_weight=self.config.minimum_tsdf_weight,
+            )
         return extract_mesh_block_sparse(
             self._tsdf,
             level=level,
