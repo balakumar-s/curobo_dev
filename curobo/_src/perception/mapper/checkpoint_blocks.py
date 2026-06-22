@@ -24,12 +24,13 @@ from curobo._src.perception.mapper.constants import (
     PY_HASH_PRIME_Y,
     PY_HASH_PRIME_Z,
     PY_POSITIVE_MASK,
+    _validate_color_grid_size,
 )
 from curobo.logging import log_and_raise
 
 
 BLOCK_CHECKPOINT_FORMAT = "curobo.mapper_blocks"
-BLOCK_CHECKPOINT_SCHEMA_VERSION = 0.8
+BLOCK_CHECKPOINT_SCHEMA_VERSION = 0.9
 
 BLOCK_CHECKPOINT_KEYS = {
     "format",
@@ -46,6 +47,7 @@ BLOCK_METADATA_KEYS = {
     "has_dynamic",
     "has_static",
     "feature_dim",
+    "color_grid_size",
 }
 
 
@@ -63,6 +65,7 @@ def build_block_metadata(tsdf) -> Dict[str, Any]:
         "has_dynamic": bool(data.has_dynamic),
         "has_static": bool(data.has_static),
         "feature_dim": int(data.feature_dim),
+        "color_grid_size": int(data.color_grid_size),
     }
 
 
@@ -162,6 +165,11 @@ def validate_block_metadata(block_metadata: Any) -> None:
     require_positive_float(block_metadata, "voxel_size")
     require_positive_float(block_metadata, "truncation_distance")
     require_positive_int(block_metadata, "block_size")
+    require_positive_int(block_metadata, "color_grid_size")
+    _validate_color_grid_size(
+        int(block_metadata["color_grid_size"]),
+        int(block_metadata["block_size"]),
+    )
     require_nonnegative_int(block_metadata, "feature_dim")
     require_bool(block_metadata, "has_dynamic")
     require_bool(block_metadata, "has_static")
@@ -190,13 +198,15 @@ def validate_block_payload(
     n_blocks = int(coords.shape[0])
     block_size = int(block_metadata["block_size"])
     block_voxels = block_size**3
+    color_grid_size = int(block_metadata["color_grid_size"])
+    color_grid_voxels = color_grid_size**3
     has_dynamic = bool(block_metadata["has_dynamic"])
     has_static = bool(block_metadata["has_static"])
     feature_dim = int(block_metadata["feature_dim"])
 
     expected_keys = {"active_block_coords"}
     if has_dynamic:
-        expected_keys.update(("block_data", "block_rgb"))
+        expected_keys.update(("block_data", "block_grid_rgb"))
     if feature_dim > 0:
         expected_keys.update(("block_features", "block_feature_weight"))
     if has_static:
@@ -208,8 +218,12 @@ def validate_block_payload(
     if has_dynamic:
         block_data = require_tensor(blocks, "block_data", torch.float16)
         require_shape(block_data, "block_data", (n_blocks, block_voxels, 2))
-        block_rgb = require_tensor(blocks, "block_rgb", torch.float16)
-        require_shape(block_rgb, "block_rgb", (n_blocks, 4))
+        block_grid_rgb = require_tensor(blocks, "block_grid_rgb", torch.float16)
+        require_shape(
+            block_grid_rgb,
+            "block_grid_rgb",
+            (n_blocks, color_grid_voxels, 4),
+        )
 
     if feature_dim > 0:
         block_features = require_tensor(blocks, "block_features", torch.float16)
@@ -260,6 +274,12 @@ def validate_block_metadata_for_target(
         log_and_raise(
             f"feature_dim mismatch: checkpoint={block_metadata['feature_dim']}, "
             f"target={data.feature_dim}."
+        )
+    if int(block_metadata["color_grid_size"]) != int(data.color_grid_size):
+        log_and_raise(
+            "color_grid_size mismatch: "
+            f"checkpoint={block_metadata['color_grid_size']}, "
+            f"target={data.color_grid_size}."
         )
 
     source_center = [float(x) for x in block_metadata["grid_center"]]
@@ -431,17 +451,21 @@ def apply_constant_dynamic_weight(
         block_data[..., 0] = (sdf * import_weight).to(dtype=block_data.dtype)
         block_data[..., 1] = observed.to(dtype=block_data.dtype) * import_weight
 
-    block_rgb = blocks["block_rgb"]
-    old_rgb_weight = block_rgb[:, 3].float()
+    block_grid_rgb = blocks["block_grid_rgb"]
+    old_rgb_weight = block_grid_rgb[..., 3].float()
     observed_rgb = old_rgb_weight > 0.0
     if observed_rgb.any():
-        avg_rgb = torch.zeros_like(block_rgb[:, :3], dtype=torch.float32)
+        avg_rgb = torch.zeros_like(block_grid_rgb[..., :3], dtype=torch.float32)
         avg_rgb[observed_rgb] = (
-            block_rgb[:, :3].float()[observed_rgb]
+            block_grid_rgb[..., :3].float()[observed_rgb]
             / old_rgb_weight[observed_rgb].unsqueeze(-1)
         )
-        block_rgb[:, :3] = (avg_rgb * import_weight).to(dtype=block_rgb.dtype)
-        block_rgb[:, 3] = observed_rgb.to(dtype=block_rgb.dtype) * import_weight
+        block_grid_rgb[..., :3] = (avg_rgb * import_weight).to(
+            dtype=block_grid_rgb.dtype
+        )
+        block_grid_rgb[..., 3] = (
+            observed_rgb.to(dtype=block_grid_rgb.dtype) * import_weight
+        )
 
 
 def apply_constant_feature_weight(

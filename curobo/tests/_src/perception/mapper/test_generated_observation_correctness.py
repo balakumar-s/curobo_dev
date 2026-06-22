@@ -256,11 +256,13 @@ def _spatial_feature_grid(
 def _active_rgb(mapper: Mapper) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     data = mapper.tsdf.data
     n = int(data.num_allocated.item())
-    block_rgb = data.block_rgb[:n].float()
-    active = block_rgb[:, 3] > 0
-    pool_idx = torch.arange(n, dtype=torch.int64, device=block_rgb.device)[active]
-    normalized = block_rgb[active, :3] / block_rgb[active, 3:4].clamp(min=1e-6)
-    return pool_idx, normalized, block_rgb[active, 3]
+    block_grid_rgb = data.block_grid_rgb[:n, 0].float()
+    active = block_grid_rgb[:, 3] > 0
+    pool_idx = torch.arange(n, dtype=torch.int64, device=block_grid_rgb.device)[active]
+    normalized = block_grid_rgb[active, :3] / block_grid_rgb[active, 3:4].clamp(
+        min=1e-6
+    )
+    return pool_idx, normalized, block_grid_rgb[active, 3]
 
 
 def _active_features(mapper: Mapper) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -281,38 +283,72 @@ def _sort_active_features_by_coord(mapper: Mapper) -> tuple[torch.Tensor, torch.
     return coords[order], normalized[order]
 
 
-def _expected_rgb_from_support(
+def _expected_rgb_from_grid_node(
     mapper: Mapper,
     rgb: torch.Tensor,
+    pool_idx: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    camera_integrator = mapper.integrator._tsdf_integrator._camera_integrator
-    n_visible = int(camera_integrator.visible_count.item())
-    max_pool = int(mapper.tsdf.data.num_allocated.item())
-    expected_sum = torch.zeros((max_pool, 3), dtype=torch.float32, device=rgb.device)
-    expected_weight = torch.zeros(max_pool, dtype=torch.float32, device=rgb.device)
-    for vis_idx in range(n_visible):
-        pool_idx = int(camera_integrator.pool_indices[vis_idx].item())
-        if pool_idx < 0:
-            continue
-        for cam_i in range(rgb.shape[0]):
-            count = int(camera_integrator.support_counts[vis_idx, cam_i].item())
-            count = min(count, mapper.config.max_support_pixels_per_block_camera)
-            if count <= 0:
-                continue
-            pixels = camera_integrator.support_pixels[vis_idx, cam_i, :count].long()
-            py = pixels // mapper.config.image_width
-            px = pixels - py * mapper.config.image_width
-            valid = (
-                (py >= 0)
-                & (py < mapper.config.image_height)
-                & (px >= 0)
-                & (px < mapper.config.image_width)
-            )
-            if valid.any():
-                values = rgb[cam_i, py[valid], px[valid]].float() / 255.0
-                expected_sum[pool_idx] += values.sum(dim=0)
-                expected_weight[pool_idx] += float(values.shape[0])
-    return expected_sum, expected_weight
+    """Expected normalized RGB for the single color-grid node per block."""
+    if rgb.ndim == 3:
+        rgb = rgb.unsqueeze(0)
+    assert rgb.shape[0] == 1
+    data = mapper.tsdf.data
+    cfg = mapper.config
+    coords = data.block_coords.view(data.max_blocks, 3)[pool_idx.long()].float()
+    block_size = int(data.block_size)
+    grid_d, grid_h, grid_w = (int(v) for v in data.grid_shape)
+    blocks_x = (grid_w + block_size - 1) // block_size
+    blocks_y = (grid_h + block_size - 1) // block_size
+    blocks_z = (grid_d + block_size - 1) // block_size
+    offsets = torch.tensor(
+        [blocks_x // 2, blocks_y // 2, blocks_z // 2],
+        dtype=torch.float32,
+        device=rgb.device,
+    )
+    center_offset = torch.tensor(
+        [grid_w, grid_h, grid_d],
+        dtype=torch.float32,
+        device=rgb.device,
+    ) * 0.5
+    local = torch.full((3,), block_size * 0.5, dtype=torch.float32, device=rgb.device)
+    voxel = (coords + offsets) * float(block_size) + local
+    origin = data.origin.to(device=rgb.device, dtype=torch.float32)
+    world = origin + (voxel - center_offset) * float(data.voxel_size)
+
+    intrinsics = _intrinsics(str(rgb.device), cfg.image_height, cfg.image_width)
+    z = world[:, 2]
+    u = intrinsics[0, 0] * world[:, 0] / z + intrinsics[0, 2]
+    v = intrinsics[1, 1] * world[:, 1] / z + intrinsics[1, 2]
+    valid = (
+        (z > cfg.depth_minimum_distance)
+        & (z <= cfg.depth_maximum_distance)
+        & (u >= 0.0)
+        & (u <= cfg.image_width - 1)
+        & (v >= 0.0)
+        & (v <= cfg.image_height - 1)
+    )
+
+    u_clamped = u.clamp(0.0, cfg.image_width - 1)
+    v_clamped = v.clamp(0.0, cfg.image_height - 1)
+    px0 = torch.floor(u_clamped).long()
+    py0 = torch.floor(v_clamped).long()
+    px1 = (px0 + 1).clamp(max=cfg.image_width - 1)
+    py1 = (py0 + 1).clamp(max=cfg.image_height - 1)
+    tx = (u_clamped - px0.float()).unsqueeze(-1)
+    ty = (v_clamped - py0.float()).unsqueeze(-1)
+
+    image = rgb[0].float() / 255.0
+    c00 = image[py0, px0]
+    c10 = image[py0, px1]
+    c01 = image[py1, px0]
+    c11 = image[py1, px1]
+    expected = (
+        c00 * (1.0 - tx) * (1.0 - ty)
+        + c10 * tx * (1.0 - ty)
+        + c01 * (1.0 - tx) * ty
+        + c11 * tx * ty
+    )
+    return expected, valid
 
 
 def _expected_features_from_support(
@@ -450,7 +486,7 @@ def test_constant_rgb_accumulates_across_frames(warp_init, device):
     assert weights_second.sum() > weights_first.sum()
 
 
-def test_gradient_rgb_matches_stored_support_pixel_reference(warp_init, device):
+def test_gradient_rgb_matches_color_grid_projection(warp_init, device):
     mapper = _make_mapper(device, support_capacity=8)
     x = torch.arange(IMAGE_W, dtype=torch.float32, device=device).view(1, IMAGE_W)
     y = torch.arange(IMAGE_H, dtype=torch.float32, device=device).view(IMAGE_H, 1)
@@ -465,11 +501,10 @@ def test_gradient_rgb_matches_stored_support_pixel_reference(warp_init, device):
     depth = torch.full((IMAGE_H, IMAGE_W), PLANE_Z, dtype=torch.float32, device=device)
 
     mapper.integrate(_observation(device=device, depth=depth, rgb=rgb))
-    expected_sum, expected_weight = _expected_rgb_from_support(mapper, rgb.unsqueeze(0))
     pool_idx, normalized, _ = _active_rgb(mapper)
-    expected_active = expected_sum[pool_idx] / expected_weight[pool_idx].view(-1, 1)
+    expected_active, valid = _expected_rgb_from_grid_node(mapper, rgb, pool_idx)
 
-    assert (expected_weight[pool_idx] > 0).all()
+    assert valid.all()
     torch.testing.assert_close(normalized, expected_active, atol=0.03, rtol=0.0)
 
 
@@ -570,7 +605,7 @@ def test_time_decay_reduces_tsdf_rgb_and_feature_weights(warp_init, device):
     )
     n = int(mapper.tsdf.data.num_allocated.item())
     before_tsdf = mapper.tsdf.data.block_data[:n, :, 1].float().sum()
-    before_rgb = mapper.tsdf.data.block_rgb[:n, 3].float().sum()
+    before_rgb = mapper.tsdf.data.block_grid_rgb[:n, :, 3].float().sum()
     before_feature = mapper.tsdf.data.block_feature_weight[:n].float().sum()
 
     empty_depth = torch.zeros((IMAGE_H, IMAGE_W), dtype=torch.float32, device=device)
@@ -584,7 +619,7 @@ def test_time_decay_reduces_tsdf_rgb_and_feature_weights(warp_init, device):
         )
     )
     after_tsdf = mapper.tsdf.data.block_data[:n, :, 1].float().sum()
-    after_rgb = mapper.tsdf.data.block_rgb[:n, 3].float().sum()
+    after_rgb = mapper.tsdf.data.block_grid_rgb[:n, :, 3].float().sum()
     after_feature = mapper.tsdf.data.block_feature_weight[:n].float().sum()
 
     assert before_tsdf > 0
@@ -627,7 +662,7 @@ def test_clear_region_removes_stale_rgb_and_features(warp_init, device):
     )
     assert n_cleared > 0
     n = int(mapper.tsdf.data.num_allocated.item())
-    assert mapper.tsdf.data.block_rgb[:n, 3].float().sum() == 0
+    assert mapper.tsdf.data.block_grid_rgb[:n, :, 3].float().sum() == 0
     assert mapper.tsdf.data.block_feature_weight[:n].float().sum() == 0
 
     mapper.integrate(
@@ -675,7 +710,7 @@ def test_stats_report_last_integration_and_kernel_timings(warp_init, device):
     assert stats["last_integration"]["num_visible_blocks"] == 0
 
 
-def test_support_capacity_overflow_matches_stored_support_reference(warp_init, device):
+def test_support_capacity_overflow_keeps_rgb_grid_and_support_features(warp_init, device):
     feature_vector = torch.tensor([0.25, 0.5, 0.75], dtype=torch.float32, device=device)
     feature_grid = _constant_feature_grid(device, feature_vector)
     mapper = _make_mapper(
@@ -694,11 +729,15 @@ def test_support_capacity_overflow_matches_stored_support_reference(warp_init, d
     stats = mapper.get_stats(scan_pool=False)
     assert stats["last_integration"]["support_overflow_count"] > 0
 
-    expected_rgb_sum, expected_rgb_weight = _expected_rgb_from_support(mapper, obs.rgb_image)
     rgb_pool_idx, rgb_normalized, _ = _active_rgb(mapper)
+    expected_rgb = torch.tensor(
+        [32.0 / 255.0, 160.0 / 255.0, 224.0 / 255.0],
+        dtype=torch.float32,
+        device=device,
+    )
     torch.testing.assert_close(
         rgb_normalized,
-        expected_rgb_sum[rgb_pool_idx] / expected_rgb_weight[rgb_pool_idx].view(-1, 1),
+        expected_rgb.view(1, 3).expand_as(rgb_normalized),
         atol=0.03,
         rtol=0.0,
     )

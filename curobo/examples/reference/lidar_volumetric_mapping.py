@@ -1042,9 +1042,11 @@ def tsdf_surface_voxels_with_blocks(mapper) -> tuple[np.ndarray, np.ndarray, np.
         + mapper.config.grid_center.detach().to(device="cpu").numpy()
     ).astype(np.float32)
 
-    rgbw = blocks["block_rgb"].to(device="cpu").float().numpy()
-    weight_rgb = np.clip(rgbw[block_idx, 3:4], 1e-6, None)
-    colors = np.clip((rgbw[block_idx, :3] / weight_rgb) * 255.0, 0.0, 255.0).astype(np.uint8)
+    rgbw = blocks["block_grid_rgb"].to(device="cpu").float().numpy()
+    weight_rgb = np.clip(rgbw[block_idx, 0, 3:4], 1e-6, None)
+    colors = np.clip((rgbw[block_idx, 0, :3] / weight_rgb) * 255.0, 0.0, 255.0).astype(
+        np.uint8
+    )
     return centers, colors, block_idx.astype(np.int64), blocks
 
 

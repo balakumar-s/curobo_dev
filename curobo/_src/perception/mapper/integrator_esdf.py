@@ -56,6 +56,7 @@ from curobo._src.perception.mapper.block_allocation import (
 )
 from curobo._src.perception.mapper.constants import (
     DEFAULT_HASH_LAYOUT,
+    _validate_color_grid_size,
     _validate_feature_channels_per_thread,
     _validate_feature_grid_shape,
     _validate_feature_integration_kernel,
@@ -191,9 +192,8 @@ class BlockSparseESDFIntegratorCfg:
     #: Compile-time cap for feature channels accumulated by one tiled
     #: feature-kernel CTA.
     max_feature_tile_channels: int = 4096
-    #: Enable a per-block local RGBW control grid for stored color.
-    use_color_grid: bool = False
-    #: Number of RGBW control points per block edge when ``use_color_grid`` is enabled.
+    #: Number of RGBW control points per block edge. This is a construction-time
+    #: kernel specialization value.
     color_grid_size: int = 1
     #: Feature integration launch policy: ``"auto"``, ``"grouped"``, or
     #: ``"tiled"``. Resolved by the TSDF integrator to the low-level launch bool.
@@ -291,15 +291,7 @@ class BlockSparseESDFIntegratorCfg:
                 "max_support_pixels_per_block_camera must be positive: "
                 f"{self.max_support_pixels_per_block_camera}"
             )
-        if not isinstance(self.use_color_grid, bool):
-            log_and_raise(
-                "use_color_grid must be bool, got "
-                f"{type(self.use_color_grid).__name__}."
-            )
-        if self.color_grid_size <= 0:
-            log_and_raise(
-                f"color_grid_size must be positive, got color_grid_size={self.color_grid_size}."
-            )
+        _validate_color_grid_size(self.color_grid_size, self.block_size)
         _validate_feature_integration_kernel(self.feature_integration_kernel)
         if not isinstance(self.profile_integration_kernel_timings, bool):
             log_and_raise(
@@ -400,7 +392,6 @@ class BlockSparseESDFIntegrator:
             max_support_pixels_per_block_camera=config.max_support_pixels_per_block_camera,
             feature_channels_per_thread=config.feature_channels_per_thread,
             max_feature_tile_channels=config.max_feature_tile_channels,
-            use_color_grid=config.use_color_grid,
             color_grid_size=config.color_grid_size,
             feature_integration_kernel=config.feature_integration_kernel,
             profile_integration_kernel_timings=config.profile_integration_kernel_timings,

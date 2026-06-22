@@ -126,10 +126,10 @@ class TestIntegration:
         num_allocated = tsdf.data.num_allocated.item()
         assert num_allocated > 0, "Should have allocated blocks"
 
-    def test_block_rgb_matches_constant_input_color(
+    def test_block_grid_rgb_matches_constant_input_color(
         self, warp_init, device, simple_intrinsics, identity_pose
     ):
-        """Per-block RGB averages should preserve a uniform input color."""
+        """Single-node block RGB grid should preserve a uniform input color."""
         config = BlockSparseTSDFIntegratorCfg(
             max_blocks=1000,
             voxel_size=0.01,
@@ -156,11 +156,11 @@ class TestIntegration:
         n = tsdf.data.num_allocated.item()
         assert n > 0
 
-        block_rgb = tsdf.data.block_rgb[:n].float()
-        active = block_rgb[:, 3] > 0
+        block_grid_rgb = tsdf.data.block_grid_rgb[:n, 0].float()
+        active = block_grid_rgb[:, 3] > 0
         assert active.any(), "Expected at least one block with RGB observations"
 
-        normalized = block_rgb[active, :3] / block_rgb[active, 3:4]
+        normalized = block_grid_rgb[active, :3] / block_grid_rgb[active, 3:4]
         expected = torch.tensor(
             [64.0 / 255.0, 128.0 / 255.0, 192.0 / 255.0],
             dtype=torch.float32,

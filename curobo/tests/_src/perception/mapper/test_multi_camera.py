@@ -111,13 +111,13 @@ def _snapshot_tsdf(integrator):
         return {
             "num_allocated": 0,
             "block_data": data.block_data[:0].clone(),
-            "block_rgb": data.block_rgb[:0].clone(),
+            "block_grid_rgb": data.block_grid_rgb[:0].clone(),
             "block_coords": data.block_coords[:0].clone(),
         }
 
     coords = data.block_coords[: n * 3].clone().view(n, 3)
     bd = data.block_data[:n].clone()
-    br = data.block_rgb[:n].clone()
+    br = data.block_grid_rgb[:n].clone()
 
     # Lexicographic sort by (bx, by, bz) for deterministic ordering.
     sort_key = coords[:, 0].long() * (2**20) + coords[:, 1].long() * (2**10) + coords[:, 2].long()
@@ -126,7 +126,7 @@ def _snapshot_tsdf(integrator):
     return {
         "num_allocated": n,
         "block_data": bd[order],
-        "block_rgb": br[order],
+        "block_grid_rgb": br[order],
         "block_coords": coords[order],
     }
 
@@ -278,11 +278,13 @@ class TestMultiCameraForLoop:
         integ.integrate(_stack_observations(obs_red, obs_blue))
 
         snap = _snapshot_tsdf(integ)
-        active = snap["block_rgb"][:, 3].float() > 0
+        active = snap["block_grid_rgb"][:, 0, 3].float() > 0
         assert active.any()
 
-        normalized = snap["block_rgb"][active, :3].float() / snap["block_rgb"][
-            active, 3:4
+        normalized = snap["block_grid_rgb"][active, 0, :3].float() / snap[
+            "block_grid_rgb"
+        ][
+            active, 0, 3:4
         ].float().clamp(min=1e-6)
         expected = torch.tensor([0.5, 0.0, 0.5], dtype=torch.float32, device=device).view(1, 3)
         torch.testing.assert_close(
@@ -340,8 +342,8 @@ class TestMultiCameraBatchEquivalence:
             rtol=1e-2,
         )
         torch.testing.assert_close(
-            snap_bat["block_rgb"].float(),
-            snap_ref["block_rgb"].float(),
+            snap_bat["block_grid_rgb"].float(),
+            snap_ref["block_grid_rgb"].float(),
             atol=1e-2,
             rtol=1e-2,
         )

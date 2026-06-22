@@ -258,7 +258,6 @@ class CameraProjectIntegrator:
             dim=(max_clearable, block_voxels),
             inputs=[
                 data.block_data,
-                data.block_rgb,
                 data.new_blocks,
                 data.new_block_count,
                 tsdf.config.max_blocks,
@@ -267,21 +266,20 @@ class CameraProjectIntegrator:
             stream=stream,
         )
         self._timer_stop("clear_new_blocks_kernel")
-        if tsdf.data.has_color_grid:
-            self._timer_start()
-            wp.launch(
-                kernels.clear_new_block_grid_rgb_kernel,
-                dim=(max_clearable, kernels.color_grid_voxels * 4),
-                inputs=[
-                    data.block_grid_rgb,
-                    data.new_blocks,
-                    data.new_block_count,
-                    tsdf.config.max_blocks,
-                ],
-                device=device,
-                stream=stream,
-            )
-            self._timer_stop("clear_new_block_grid_rgb_kernel")
+        self._timer_start()
+        wp.launch(
+            kernels.clear_new_block_grid_rgb_kernel,
+            dim=(max_clearable, kernels.color_grid_voxels * 4),
+            inputs=[
+                data.block_grid_rgb,
+                data.new_blocks,
+                data.new_block_count,
+                tsdf.config.max_blocks,
+            ],
+            device=device,
+            stream=stream,
+        )
+        self._timer_stop("clear_new_block_grid_rgb_kernel")
         if tsdf.data.has_features:
             self._timer_start()
             feature_dim_cfg = tsdf.data.feature_dim
@@ -446,7 +444,6 @@ class CameraProjectIntegrator:
                     wp.from_torch(pool_indices),
                     wp.from_torch(self.clear_count),
                     data.block_data,
-                    data.block_rgb,
                     data.block_sums,
                     tsdf.config.max_blocks,
                 ],
@@ -454,19 +451,18 @@ class CameraProjectIntegrator:
                 stream=stream,
             )
 
-        if tsdf.data.has_color_grid:
-            wp.launch(
-                kernels.clear_block_grid_rgb_by_pool_kernel,
-                dim=(n_clear, kernels.color_grid_voxels * 4),
-                inputs=[
-                    wp.from_torch(pool_indices),
-                    wp.from_torch(self.clear_count),
-                    data.block_grid_rgb,
-                    tsdf.config.max_blocks,
-                ],
-                device=device,
-                stream=stream,
-            )
+        wp.launch(
+            kernels.clear_block_grid_rgb_by_pool_kernel,
+            dim=(n_clear, kernels.color_grid_voxels * 4),
+            inputs=[
+                wp.from_torch(pool_indices),
+                wp.from_torch(self.clear_count),
+                data.block_grid_rgb,
+                tsdf.config.max_blocks,
+            ],
+            device=device,
+            stream=stream,
+        )
 
         if tsdf.data.has_features:
             feature_dim = tsdf.data.feature_dim
@@ -732,9 +728,7 @@ class CameraProjectIntegrator:
                 "MapperCfg.feature_dim or BlockSparseTSDFIntegratorCfg.feature_dim."
             )
 
-        needs_support_pixels = (not tsdf.data.has_color_grid) or (
-            tsdf.data.has_features and feature_grid is not None
-        )
+        needs_support_pixels = tsdf.data.has_features and feature_grid is not None
         if needs_support_pixels:
             self._build_support_pixels(
                 tsdf,
@@ -770,45 +764,27 @@ class CameraProjectIntegrator:
             stream=stream,
         )
         self._timer_stop("integrate_voxels_kernel")
-        if tsdf.data.has_color_grid:
-            self._timer_start()
-            wp.launch(
-                kernels.integrate_block_grid_rgb_kernel,
-                dim=(num_visible_blocks, kernels.color_grid_voxels),
-                inputs=[
-                    wp.from_torch(self.pool_indices),
-                    num_visible_blocks,
-                    wp.from_torch(intrinsics, dtype=wp.float32),
-                    wp.from_torch(cam_positions, dtype=wp.float32),
-                    wp.from_torch(cam_quaternions, dtype=wp.float32),
-                    wp.from_torch(depth_images, dtype=wp.float32),
-                    wp.from_torch(rgb_flat, dtype=wp.uint8),
-                    depth_min,
-                    depth_max,
-                    data.block_coords,
-                    data.block_grid_rgb,
-                ],
-                device=device,
-                stream=stream,
-            )
-            self._timer_stop("integrate_block_grid_rgb_kernel")
-        else:
-            self._timer_start()
-            wp.launch(
-                kernels.integrate_block_rgb_from_support_kernel,
-                dim=(num_visible_blocks, n_cameras),
-                inputs=[
-                    wp.from_torch(self.pool_indices),
-                    num_visible_blocks,
-                    wp.from_torch(self.support_counts),
-                    wp.from_torch(self.support_pixels),
-                    wp.from_torch(rgb_flat, dtype=wp.uint8),
-                    data.block_rgb,
-                ],
-                device=device,
-                stream=stream,
-            )
-            self._timer_stop("integrate_block_rgb_from_support_kernel")
+        self._timer_start()
+        wp.launch(
+            kernels.integrate_block_grid_rgb_kernel,
+            dim=(num_visible_blocks, kernels.color_grid_voxels),
+            inputs=[
+                wp.from_torch(self.pool_indices),
+                num_visible_blocks,
+                wp.from_torch(intrinsics, dtype=wp.float32),
+                wp.from_torch(cam_positions, dtype=wp.float32),
+                wp.from_torch(cam_quaternions, dtype=wp.float32),
+                wp.from_torch(depth_images, dtype=wp.float32),
+                wp.from_torch(rgb_flat, dtype=wp.vec3ub),
+                depth_min,
+                depth_max,
+                data.block_coords,
+                data.block_grid_rgb,
+            ],
+            device=device,
+            stream=stream,
+        )
+        self._timer_stop("integrate_block_grid_rgb_kernel")
 
         if tsdf.data.has_features and feature_grid is not None:
             self._timer_start()
@@ -900,39 +876,34 @@ class CameraProjectIntegrator:
                 feature_kernel_name = "integrate_features_from_support_grouped_kernel"
             self._timer_stop(feature_kernel_name)
 
-        # Cap fp16 accumulators so weighted sums stay finite while preserving
-        # means. Block RGB is only touched on the legacy color path; the
-        # optional RGB grid has its own per-node rescale kernel.
-        if (not tsdf.data.has_color_grid) or tsdf.data.has_features:
+        # Cap fp16 accumulators so weighted sums stay finite while preserving means.
+        if tsdf.data.has_features:
             self._timer_start()
-            n_channels = max(3, kernels.feature_dim)
             wp.launch(
                 kernels.rescale_block_accumulators_kernel,
-                dim=(num_visible_blocks, n_channels),
+                dim=(num_visible_blocks, kernels.feature_dim),
                 inputs=[
                     wp.from_torch(self.pool_indices),
                     num_visible_blocks,
                     float(tsdf.config.accumulator_w_max),
                     data.block_features,
                     data.block_feature_weight,
-                    data.block_rgb,
                 ],
                 device=device,
                 stream=stream,
             )
             self._timer_stop("rescale_block_accumulators_kernel")
-        if tsdf.data.has_color_grid:
-            self._timer_start()
-            wp.launch(
-                kernels.rescale_block_grid_rgb_kernel,
-                dim=(num_visible_blocks, kernels.color_grid_voxels * 3),
-                inputs=[
-                    wp.from_torch(self.pool_indices),
-                    num_visible_blocks,
-                    float(tsdf.config.accumulator_w_max),
-                    data.block_grid_rgb,
-                ],
-                device=device,
-                stream=stream,
-            )
-            self._timer_stop("rescale_block_grid_rgb_kernel")
+        self._timer_start()
+        wp.launch(
+            kernels.rescale_block_grid_rgb_kernel,
+            dim=(num_visible_blocks, kernels.color_grid_voxels * 3),
+            inputs=[
+                wp.from_torch(self.pool_indices),
+                num_visible_blocks,
+                float(tsdf.config.accumulator_w_max),
+                data.block_grid_rgb,
+            ],
+            device=device,
+            stream=stream,
+        )
+        self._timer_stop("rescale_block_grid_rgb_kernel")

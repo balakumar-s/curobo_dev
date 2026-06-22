@@ -71,6 +71,41 @@ class TestKernelBuilderConstruction:
         with pytest.raises(ValueError, match="block_size"):
             make_block_sparse_kernels(block_size=bad_value)
 
+    def test_color_grid_size_can_match_block_size(self, warp_init):
+        class Cfg:
+            block_size = 8
+            color_grid_size = 8
+            feature_dim = 0
+            num_cameras = 1
+            image_height = 8
+            image_width = 8
+            lidar_num_sensors = 0
+            grid_shape = (16, 16, 16)
+            origin = (0.0, 0.0, 0.0)
+            voxel_size = 0.01
+            truncation_distance = 0.04
+
+        kernels = make_block_sparse_kernels(Cfg)
+        assert kernels.color_grid_size == 8
+        assert kernels.color_grid_voxels == 8**3
+
+    def test_color_grid_size_cannot_exceed_block_size(self, warp_init):
+        class Cfg:
+            block_size = 4
+            color_grid_size = 5
+            feature_dim = 0
+            num_cameras = 1
+            image_height = 8
+            image_width = 8
+            lidar_num_sensors = 0
+            grid_shape = (16, 16, 16)
+            origin = (0.0, 0.0, 0.0)
+            voxel_size = 0.01
+            truncation_distance = 0.04
+
+        with pytest.raises(ValueError, match="color_grid_size.*block_size"):
+            make_block_sparse_kernels(Cfg)
+
     def test_feature_channel_grouping_specializes_feature_kernel(self, warp_init):
         k3 = make_block_sparse_kernels(block_size=8, feature_channels_per_thread=3)
         k4 = make_block_sparse_kernels(block_size=8, feature_channels_per_thread=4)

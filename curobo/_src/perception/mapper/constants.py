@@ -106,6 +106,22 @@ def _validate_block_size(block_size: int) -> None:
         )
 
 
+def _validate_color_grid_size(color_grid_size: int, block_size: int) -> None:
+    """Validate the compile-time RGB control-grid resolution."""
+    if not isinstance(color_grid_size, int) or isinstance(color_grid_size, bool):
+        log_and_raise(
+            "color_grid_size must be a plain int, got "
+            f"{type(color_grid_size).__name__} ({color_grid_size!r})."
+        )
+    if color_grid_size < 1:
+        log_and_raise(f"color_grid_size must be >= 1, got {color_grid_size}.")
+    if color_grid_size > block_size:
+        log_and_raise(
+            "color_grid_size must be <= block_size, got "
+            f"color_grid_size={color_grid_size}, block_size={block_size}."
+        )
+
+
 def _validate_feature_channels_per_thread(feature_channels_per_thread: int) -> None:
     """Validate feature-channel grouping for the generated integration kernel.
 

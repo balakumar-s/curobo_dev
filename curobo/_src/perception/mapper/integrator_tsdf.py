@@ -34,6 +34,7 @@ from curobo._src.perception.mapper.block_allocation import (
 )
 from curobo._src.perception.mapper.constants import (
     DEFAULT_HASH_LAYOUT,
+    _validate_color_grid_size,
     _validate_feature_channels_per_thread,
     _validate_feature_grid_shape,
     _validate_feature_integration_kernel,
@@ -166,11 +167,9 @@ class BlockSparseTSDFIntegratorCfg:
     #: Compile-time cap for feature channels accumulated by one tiled
     #: feature-kernel CTA.
     max_feature_tile_channels: int = 4096
-    #: Enable a per-block local RGBW control grid. This keeps legacy block RGB
-    #: available while allowing larger block sizes to retain spatial color.
-    use_color_grid: bool = False
-    #: Number of RGBW control points per block edge when ``use_color_grid`` is
-    #: enabled. Total controls per block are ``color_grid_size ** 3``.
+    #: Number of RGBW control points per block edge. This is a construction-time
+    #: kernel specialization value. Total controls per block are
+    #: ``color_grid_size ** 3``.
     color_grid_size: int = 1
     #: Feature integration launch policy: ``"auto"``, ``"grouped"``, or
     #: ``"tiled"``. Resolved to a low-level tiled bool at construction time.
@@ -179,7 +178,7 @@ class BlockSparseTSDFIntegratorCfg:
     #: ``get_stats()["last_integration_kernel_timings_ms"]``.
     profile_integration_kernel_timings: bool = False
     #: Upper bound on per-block accumulator weight after each frame. Caps
-    #: the fp16 weighted-sum magnitudes in ``block_rgb`` and
+    #: the fp16 weighted-sum magnitudes in ``block_grid_rgb`` and
     #: ``block_features``; also sets EMA decay rate
     #: ``W_max / mean_per_frame_weight`` for old observations. See
     #: :attr:`BlockSparseTSDFCfg.accumulator_w_max`.
@@ -291,15 +290,7 @@ class BlockSparseTSDFIntegratorCfg:
                 f"max_support_pixels_per_block_camera="
                 f"{self.max_support_pixels_per_block_camera}."
             )
-        if not isinstance(self.use_color_grid, bool):
-            log_and_raise(
-                "use_color_grid must be bool, got "
-                f"{type(self.use_color_grid).__name__}."
-            )
-        if self.color_grid_size <= 0:
-            log_and_raise(
-                f"color_grid_size must be positive, got color_grid_size={self.color_grid_size}."
-            )
+        _validate_color_grid_size(self.color_grid_size, self.block_size)
         _validate_feature_integration_kernel(self.feature_integration_kernel)
         if not isinstance(self.profile_integration_kernel_timings, bool):
             log_and_raise(
@@ -380,7 +371,6 @@ class BlockSparseTSDFIntegrator:
             feature_channels_per_thread=config.feature_channels_per_thread,
             max_feature_tile_channels=config.max_feature_tile_channels,
             max_support_pixels_per_block_camera=config.max_support_pixels_per_block_camera,
-            use_color_grid=config.use_color_grid,
             color_grid_size=config.color_grid_size,
             accumulator_w_max=config.accumulator_w_max,
         )

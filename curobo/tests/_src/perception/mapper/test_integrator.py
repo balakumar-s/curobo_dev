@@ -118,7 +118,7 @@ class TestBlockSparseTSDFIntegrator:
         )
         integrator = BlockSparseTSDFIntegrator(config)
         integrator.tsdf.data.block_data.fill_(7.0)
-        integrator.tsdf.data.block_rgb.fill_(5.0)
+        integrator.tsdf.data.block_grid_rgb.fill_(5.0)
         integrator.tsdf.data.block_features.fill_(3.0)
         integrator.tsdf.data.block_feature_weight.fill_(2.0)
 
@@ -147,7 +147,7 @@ class TestBlockSparseTSDFIntegrator:
         n_allocated = int(integrator.tsdf.data.num_allocated.item())
         assert n_allocated > 0
         assert torch.count_nonzero(integrator.tsdf.data.block_data[:n_allocated]).item() == 0
-        assert torch.count_nonzero(integrator.tsdf.data.block_rgb[:n_allocated]).item() == 0
+        assert torch.count_nonzero(integrator.tsdf.data.block_grid_rgb[:n_allocated]).item() == 0
         assert (
             torch.count_nonzero(integrator.tsdf.data.block_features[:n_allocated]).item()
             == 0

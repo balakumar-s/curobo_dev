@@ -12,12 +12,13 @@ This module provides:
 Memory Layout:
     Block size: ``block_size**3`` voxels per block (default 8**3 = 512)
     Per voxel: 2 × float16 (sdf_weight, weight)
-    Per block: 4 × float16 RGBW + feature_dim × float16 features + 1 × float16 feature_weight
+    Per block: color_grid_size**3 × 4 × float16 RGBW +
+        feature_dim × float16 features + 1 × float16 feature_weight
 
 Memory Budget example (block_size=8, 100K blocks):
     - hash_table:         1.6 MB (200K × 8 bytes, packed key+value)
     - block_data:       200.0 MB (100K × 512 × 2 × 2 bytes)
-    - block_rgb:          0.8 MB (100K × 4 × 2 bytes)
+    - block_grid_rgb:     0.8 MB (100K × 1 × 4 × 2 bytes, color_grid_size=1)
     - block_coords:       1.2 MB (100K × 3 × 4 bytes)
     - block_to_hash_slot: 0.4 MB (100K × 4 bytes)
     - free_list:          0.4 MB (100K × 4 bytes)
@@ -26,13 +27,14 @@ Memory Budget example (block_size=8, 100K blocks):
     ─────────────────────────────────
     Total:              ~205 MB (vs 4+ GB dense = 20× savings)
 
-All per-block weighted-sum accumulators (``block_rgb``, ``block_features``,
-``block_feature_weight``) are stored as fp16. The integration kernels
-pre-normalize RGB inputs by 255 and feature inputs to unit magnitude so
-per-pixel atomic-add increments stay ``O(1)``. A post-frame rescale
-kernel caps each per-block weight at :attr:`BlockSparseTSDFCfg.accumulator_w_max`
-and scales the weighted-sum channels proportionally, preserving the
-weighted mean while keeping magnitudes inside fp16's finite range.
+All per-block weighted-sum accumulators (``block_grid_rgb``,
+``block_features``, ``block_feature_weight``) are stored as fp16. The
+integration kernels pre-normalize RGB inputs by 255 and feature inputs
+to unit magnitude so per-pixel atomic-add increments stay ``O(1)``.
+A post-frame rescale kernel caps each per-node/block weight at
+:attr:`BlockSparseTSDFCfg.accumulator_w_max` and scales the weighted-sum
+channels proportionally, preserving the weighted mean while keeping
+magnitudes inside fp16's finite range.
 """
 
 import math
@@ -55,6 +57,7 @@ from curobo._src.perception.mapper.constants import (
     PY_HASH_EMPTY,
     PY_HASH_TOMBSTONE,
     PY_VALUE_MASK,
+    _validate_color_grid_size,
     _validate_feature_channels_per_thread,
     _validate_feature_grid_shape,
     _validate_block_size,
@@ -131,17 +134,14 @@ class BlockSparseTSDFCfg:
     #: Compile-time support-pixel capacity specialized into RGB and feature
     #: integration kernels. Must match the projective scratch depth.
     max_support_pixels_per_block_camera: int = 32
-    #: Enable a per-block local RGBW control grid. When disabled the mapper
-    #: uses the legacy one-RGBW-accumulator-per-block path.
-    use_color_grid: bool = False
-    #: Number of RGBW control points per block edge when ``use_color_grid`` is
-    #: enabled. Total storage is ``color_grid_size ** 3`` RGBW accumulators per
-    #: block.
+    #: Number of RGBW control points per block edge. This is a construction-time
+    #: kernel specialization value; changing it requires rebuilding storage and
+    #: kernels. Total storage is ``color_grid_size ** 3`` RGBW accumulators per block.
     color_grid_size: int = 1
-    #: Upper bound on per-block accumulator weight (``block_rgb[:, 3]`` and
-    #: ``block_feature_weight``) after each integration step. Caps the
-    #: magnitude of the fp16 weighted-sum accumulators so they stay inside
-    #: fp16's finite range and bounds ulp-loss on subsequent atomic adds.
+    #: Upper bound on per-node RGB grid weight and per-block feature weight
+    #: after each integration step. Caps the magnitude of fp16 weighted-sum
+    #: accumulators so they stay inside fp16's finite range and bounds
+    #: ulp-loss on subsequent atomic adds.
     #: Setting this finite also gives the mapper EMA semantics: old
     #: observations decay at a rate set by
     #: ``W_max / mean_per_frame_weight``, which is desirable for dynamic
@@ -177,16 +177,7 @@ class BlockSparseTSDFCfg:
                 "max_support_pixels_per_block_camera must be positive, got "
                 f"{self.max_support_pixels_per_block_camera}."
             )
-        if not isinstance(self.use_color_grid, bool):
-            raise ValueError(
-                "use_color_grid must be bool, got "
-                f"{type(self.use_color_grid).__name__}."
-            )
-        if self.color_grid_size <= 0:
-            raise ValueError(
-                "color_grid_size must be positive, got "
-                f"{self.color_grid_size}."
-            )
+        _validate_color_grid_size(self.color_grid_size, self.block_size)
         if self.max_blocks > DEFAULT_HASH_LAYOUT.max_pool_idx:
             raise ValueError(
                 f"max_blocks={self.max_blocks:,} exceeds the "
@@ -207,29 +198,74 @@ class BlockSparseTSDFCfg:
 class BlockDataView:
     """References (not copies) to per-block tensors.
 
-    Index any field with ``block_idx_per_voxel`` (global ``pool_idx``) returned
-    by :func:`extract_occupied_voxels`. Normalize RGB by dividing the first
-    3 columns by the weight column::
-
-        rgb_unweighted = view.rgb[:, :3] / view.rgb[:, 3:4]
-
     The tensors reference the underlying
     :class:`BlockSparseTSDFData` storage; callers must treat them as
     read-only (mutation affects storage).
+
+    RGB is stored as a per-block local control grid. Use
+    :meth:`sample_rgbw_at_centers` to gather nearest-node RGBW values for
+    voxel centers returned by :func:`extract_occupied_voxels`.
 
     When the feature channel is disabled (``feature_dim == 0``),
     ``features`` / ``feature_weight`` are dummy ``(1, 1)`` / ``(1,)``
     tensors kept only for Warp compatibility.
     """
 
-    rgb: torch.Tensor  # (max_blocks, 4) fp16 weighted sums [R*w, G*w, B*w, W]
+    rgb_grid: torch.Tensor  # (max_blocks, color_grid_size**3, 4) fp16 RGBW sums
     coords: torch.Tensor  # (max_blocks * 3,) int32 signed centered block keys
     num_allocated: int
+    origin: torch.Tensor  # (3,) float32 grid center
     voxel_size: float
     block_size: int
+    grid_shape: Tuple[int, int, int]
+    color_grid_size: int
     features: torch.Tensor  # (max_blocks, feature_dim) fp16 weighted sums, or (1, 1) dummy
     feature_weight: torch.Tensor  # (max_blocks,) fp16 weight sums, or (1,) dummy
     feature_dim: int  # 0 when the feature channel is disabled
+
+    def sample_rgbw_at_centers(
+        self,
+        centers: torch.Tensor,
+        block_idx_per_voxel: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather nearest-node RGBW values for voxel centers."""
+        if centers.numel() == 0:
+            return self.rgb_grid.new_empty((0, 4), dtype=torch.float32)
+
+        pool_idx = block_idx_per_voxel.long()
+        if self.color_grid_size <= 1 or self.block_size <= 1:
+            return self.rgb_grid[pool_idx, 0].float()
+
+        coords = self.coords.view(-1, 3)[pool_idx].long()
+        grid_d, grid_h, grid_w = (int(v) for v in self.grid_shape)
+        blocks_x = (grid_w + self.block_size - 1) // self.block_size
+        blocks_y = (grid_h + self.block_size - 1) // self.block_size
+        blocks_z = (grid_d + self.block_size - 1) // self.block_size
+        offsets = torch.tensor(
+            [blocks_x // 2, blocks_y // 2, blocks_z // 2],
+            dtype=coords.dtype,
+            device=coords.device,
+        )
+        block_base = (coords + offsets).to(dtype=centers.dtype) * float(self.block_size)
+        center_offset = torch.tensor(
+            [grid_w, grid_h, grid_d],
+            dtype=centers.dtype,
+            device=centers.device,
+        ) * 0.5
+        voxel_f = (centers - self.origin.to(device=centers.device, dtype=centers.dtype))
+        voxel_f = voxel_f / float(self.voxel_size) + center_offset
+        local = voxel_f - block_base.to(device=centers.device)
+
+        grid_max = float(self.color_grid_size - 1)
+        scale = grid_max / float(self.block_size - 1)
+        grid_f = ((local - 0.5) * scale).clamp(min=0.0, max=grid_max)
+        grid_idx = torch.floor(grid_f + 0.5).to(dtype=torch.long)
+        node_idx = (
+            grid_idx[:, 2] * self.color_grid_size * self.color_grid_size
+            + grid_idx[:, 1] * self.color_grid_size
+            + grid_idx[:, 0]
+        )
+        return self.rgb_grid[pool_idx, node_idx].float()
 
     def features_normalized(self, eps: float = 1e-6) -> torch.Tensor:
         """Return active-block features normalized by per-block weight.
@@ -277,7 +313,10 @@ class OccupiedVoxels:
         ``[0, 255]`` before the uint8 cast. Clamp protects degenerate
         blocks with zero weight from division by zero.
         """
-        rgb = self.block_data.rgb[self.block_idx_per_voxel].float()
+        rgb = self.block_data.sample_rgbw_at_centers(
+            self.centers,
+            self.block_idx_per_voxel,
+        )
         normalized = rgb[:, :3] / rgb[:, 3:4].clamp(min=eps)
         return (normalized * 255.0).clamp(0.0, 255.0).to(torch.uint8)
 
@@ -379,8 +418,7 @@ class BlockSparseTSDFData:
 
     # Block pool - packed voxel data (3D for Warp INT32_MAX compatibility)
     block_data: torch.Tensor  # (max_blocks, block_size**3, 2) float16 or (1, 1, 2) dummy
-    block_rgb: torch.Tensor  # (max_blocks, 4) float16 - per-block [R×w, G×w, B×w, W]
-    block_grid_rgb: torch.Tensor  # (max_blocks, color_grid_size**3, 4) fp16 or dummy
+    block_grid_rgb: torch.Tensor  # (max_blocks, color_grid_size**3, 4) fp16 RGBW sums
 
     # Per-block feature channel (weighted-sum accumulator + dedicated weight)
     block_features: torch.Tensor  # (max_blocks, feature_dim) float16 or (1, 1) dummy
@@ -427,7 +465,6 @@ class BlockSparseTSDFData:
     has_dynamic: bool = True
     has_static: bool = False
     has_features: bool = False
-    has_color_grid: bool = False
     feature_dim: int = 0
     color_grid_size: int = 1
 
@@ -447,8 +484,6 @@ class BlockSparseTSDFData:
 
         # Block pool - dynamic channel
         s.block_data = wp.from_torch(self.block_data, dtype=wp.float16)
-        # Per-block weighted sums (fp16)
-        s.block_rgb = wp.from_torch(self.block_rgb, dtype=wp.float16)
         s.block_grid_rgb = wp.from_torch(self.block_grid_rgb, dtype=wp.float16)
 
         # Per-block feature channel (fp16 weighted sums, post-frame cap bounds magnitude)
@@ -462,7 +497,6 @@ class BlockSparseTSDFData:
         s.has_dynamic = self.has_dynamic
         s.has_static = self.has_static
         s.has_features = self.has_features
-        s.has_color_grid = self.has_color_grid
         s.feature_dim = self.feature_dim
         s.color_grid_size = self.color_grid_size
 
@@ -628,10 +662,6 @@ class BlockSparseTSDF:
             "config.max_support_pixels_per_block_camera="
             f"{config.max_support_pixels_per_block_camera}"
         )
-        assert kernels.use_color_grid == config.use_color_grid, (
-            f"kernels.use_color_grid={kernels.use_color_grid} does not match "
-            f"config.use_color_grid={config.use_color_grid}"
-        )
         assert kernels.color_grid_size == config.color_grid_size, (
             f"kernels.color_grid_size={kernels.color_grid_size} does not match "
             f"config.color_grid_size={config.color_grid_size}"
@@ -703,18 +733,11 @@ class BlockSparseTSDF:
             )
 
         color_grid_voxels = config.color_grid_size**3
-        if config.use_color_grid:
-            block_grid_rgb = torch.zeros(
-                (config.max_blocks, color_grid_voxels, 4),
-                dtype=torch.float16,
-                device=self.device,
-            )
-        else:
-            block_grid_rgb = torch.zeros(
-                (1, 1, 4),
-                dtype=torch.float16,
-                device=self.device,
-            )
+        block_grid_rgb = torch.zeros(
+            (config.max_blocks, color_grid_voxels, 4),
+            dtype=torch.float16,
+            device=self.device,
+        )
 
         # Pre-allocate all tensors
         self._data = BlockSparseTSDFData(
@@ -727,19 +750,9 @@ class BlockSparseTSDF:
             ),
             # Block pool - dynamic channel (conditional)
             block_data=block_data,
-            # Per-block RGBW: [R×w, G×w, B×w, weight_sum]
-            # One color per block (not per voxel) - block_size**3 memory savings
-            # Divide by channel 3 (weight_sum) at read time for averaging.
-            # fp16 storage: integration pre-normalizes RGB to [0, 1] and a
-            # post-frame rescale kernel caps the weight at
-            # config.accumulator_w_max so accumulators stay in fp16 range.
-            block_rgb=torch.zeros(
-                (config.max_blocks, 4),
-                dtype=torch.float16,
-                device=self.device,
-            ),
-            # Optional per-block local RGBW control lattice. Kept separate
-            # from block_rgb so legacy block-color behavior remains available.
+            # Per-block local RGBW control lattice. RGB is pre-normalized
+            # to [0, 1] at integration/stamping sites; divide by channel 3
+            # and multiply by 255 at read time for uint8 colors.
             block_grid_rgb=block_grid_rgb,
             # Per-block feature channel (conditional). feature_dim==0 gives
             # (1, 1) / (1,) dummies so the Warp struct can always be built.
@@ -812,7 +825,6 @@ class BlockSparseTSDF:
             has_dynamic=config.enable_dynamic,
             has_static=config.enable_static,
             has_features=has_features,
-            has_color_grid=config.use_color_grid,
             feature_dim=config.feature_dim,
             color_grid_size=config.color_grid_size,
         )
@@ -898,8 +910,8 @@ class BlockSparseTSDF:
         if self._data.has_static:
             self._data.static_block_data.fill_(float("inf"))
 
-        # Note: block_data, block_rgb, and block_grid_rgb are cleared lazily when blocks
-        # are allocated (via clear_new_blocks_kernel)
+        # Note: block_data and block_grid_rgb are cleared lazily when blocks
+        # are allocated.
 
     def export_blocks(self) -> Dict[str, torch.Tensor]:
         """Export active block payload tensors in compact pool order.
@@ -921,7 +933,9 @@ class BlockSparseTSDF:
         }
         if self._data.has_dynamic:
             blocks["block_data"] = self._data.block_data[active_pool_idx].clone()
-            blocks["block_rgb"] = self._data.block_rgb[active_pool_idx].clone()
+            blocks["block_grid_rgb"] = self._data.block_grid_rgb[
+                active_pool_idx
+            ].clone()
         if self._data.has_features:
             blocks["block_features"] = self._data.block_features[active_pool_idx].clone()
             blocks["block_feature_weight"] = self._data.block_feature_weight[
@@ -1001,13 +1015,13 @@ class BlockSparseTSDF:
 
         if self._data.has_dynamic:
             self._data.block_data.zero_()
-            self._data.block_rgb.zero_()
+            self._data.block_grid_rgb.zero_()
             if n_blocks > 0:
                 self._data.block_data[:n_blocks].copy_(
                     blocks["block_data"].to(device=self.device)
                 )
-                self._data.block_rgb[:n_blocks].copy_(
-                    blocks["block_rgb"].to(device=self.device)
+                self._data.block_grid_rgb[:n_blocks].copy_(
+                    blocks["block_grid_rgb"].to(device=self.device)
                 )
                 self._data.block_sums[:n_blocks].copy_(
                     self._data.block_data[:n_blocks, :, 1].sum(
@@ -1192,7 +1206,6 @@ class BlockSparseTSDF:
         total = 0
         total += self._data.hash_table.numel() * 8  # int64 (packed key+value)
         total += self._data.block_data.numel() * 2  # float16
-        total += self._data.block_rgb.numel() * 2  # float16
         total += self._data.block_grid_rgb.numel() * 2  # float16
         total += self._data.block_features.numel() * 2  # float16
         total += self._data.block_feature_weight.numel() * 2  # float16

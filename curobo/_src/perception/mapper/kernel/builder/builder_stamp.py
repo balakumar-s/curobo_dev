@@ -43,6 +43,7 @@ def make_stamp_kernels(
     hash_lookup,
     hash_table_insert_with_pool_idx,
     free_list_pop,
+    color_grid_size: int,
 ) -> dict[str, object]:
     """Build obstacle-stamping kernels."""
     suffix = (
@@ -58,6 +59,8 @@ def make_stamp_kernels(
     ORIGIN_Z = wp.constant(wp.float32(origin_xyz[2]))
     VOXEL_SIZE = wp.constant(wp.float32(voxel_size))
     TRUNCATION_DIST = wp.constant(wp.float32(truncation_distance))
+    color_grid_voxels = int(color_grid_size) ** 3
+    COLOR_GRID_VOXELS = wp.constant(wp.int32(color_grid_voxels))
     max_sdf_threshold = truncation_distance + (3.0**0.5) * block_size * voxel_size * 0.5
     MAX_SDF_THRESHOLD = wp.constant(wp.float32(max_sdf_threshold))
 
@@ -318,37 +321,37 @@ def make_stamp_kernels(
     # Phase 7: Update Block Colors
     # =====================================================================
 
-    @warp_kernel(f"update_block_rgb_kernel_bs{block_size}")
-    def update_block_rgb_kernel(
-        block_rgb: wp.array2d(dtype=wp.float16),
+    @warp_kernel(f"update_block_grid_rgb_kernel_bs{block_size}_gs{color_grid_size}")
+    def update_block_grid_rgb_kernel(
+        block_grid_rgb: wp.array3d(dtype=wp.float16),
         pool_indices: wp.array(dtype=wp.int32),
         n_unique: wp.int32,
         static_color: wp.vec3,
     ):
-        """Update block RGB with constant static color for allocated blocks.
+        """Update every RGB-grid node with constant static color.
 
         ``static_color`` must be pre-normalized to ``[0, 1]`` (the
         launcher divides the uint8-style config value by 255) to
         match the integration convention and keep the fp16-stored
         weighted sums consistent with the dynamic-channel values.
         """
-        tid = wp.tid()
-        if tid >= n_unique:
+        tid, node_idx = wp.tid()
+        if tid >= n_unique or node_idx >= COLOR_GRID_VOXELS:
             return
 
         pool_idx = pool_indices[tid]
         if pool_idx < 0:
             return
 
-        block_rgb[pool_idx, 0] = wp.float16(static_color[0])
-        block_rgb[pool_idx, 1] = wp.float16(static_color[1])
-        block_rgb[pool_idx, 2] = wp.float16(static_color[2])
-        block_rgb[pool_idx, 3] = wp.float16(1.0)
+        block_grid_rgb[pool_idx, node_idx, 0] = wp.float16(static_color[0])
+        block_grid_rgb[pool_idx, node_idx, 1] = wp.float16(static_color[1])
+        block_grid_rgb[pool_idx, node_idx, 2] = wp.float16(static_color[2])
+        block_grid_rgb[pool_idx, node_idx, 3] = wp.float16(1.0)
 
     return {
         "preallocate_unique_blocks_kernel": preallocate_unique_blocks_kernel,
         "enumerate_blocks_from_aabb_kernel": enumerate_blocks_from_aabb_kernel,
         "filter_blocks_by_sdf_kernel": filter_blocks_by_sdf_kernel,
         "stamp_sdf_kernel": stamp_sdf_kernel,
-        "update_block_rgb_kernel": update_block_rgb_kernel,
+        "update_block_grid_rgb_kernel": update_block_grid_rgb_kernel,
     }

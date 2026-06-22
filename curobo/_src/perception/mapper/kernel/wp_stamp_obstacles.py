@@ -370,10 +370,9 @@ def stamp_obstacles(
         stream=stream,
     )
 
-    # ``block_rgb`` stores uint8-normalized weighted sums (RGB in [0, 1]).
+    # ``block_grid_rgb`` stores uint8-normalized weighted sums (RGB in [0, 1]).
     # Callers pass uint8-style colors (e.g. (20, 20, 20)); divide by 255
-    # so the stored accumulator matches the dynamic-channel convention
-    # and ``compute_avg_rgb_*_from_block`` recover the intended color.
+    # so the stored accumulator matches the dynamic-channel convention.
     inv_255 = 1.0 / 255.0
     static_rgb = wp.vec3(
         float(static_color[0]) * inv_255,
@@ -381,10 +380,10 @@ def stamp_obstacles(
         float(static_color[2]) * inv_255,
     )
     wp.launch(
-        kernel=kernels.update_block_rgb_kernel,
-        dim=n_unique,
+        kernel=kernels.update_block_grid_rgb_kernel,
+        dim=(n_unique, kernels.color_grid_voxels),
         inputs=[
-            warp_tsdf.block_rgb,
+            warp_tsdf.block_grid_rgb,
             wp.from_torch(pool_indices, dtype=wp.int32),
             n_unique,
             static_rgb,

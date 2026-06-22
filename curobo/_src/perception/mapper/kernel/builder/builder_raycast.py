@@ -36,8 +36,6 @@ def make_raycast_kernels(
     block_size: int,
     *,
     hash_lookup,
-    compute_avg_rgb_from_block,
-    compute_avg_rgb_uint8_from_block,
     voxel_to_world,
     voxel_to_world_corner,
     block_grid_to_key_coords,
@@ -45,12 +43,10 @@ def make_raycast_kernels(
     world_to_block_coords,
     world_to_block_and_local,
     world_to_continuous_voxel,
-    use_color_grid: bool = False,
     color_grid_size: int = 1,
 ) -> dict[str, object]:
     """Build raycast and voxel-extraction kernels."""
     BS = wp.constant(block_size)
-    USE_COLOR_GRID = wp.constant(bool(use_color_grid))
     COLOR_GRID_SIZE = wp.constant(wp.int32(color_grid_size))
 
     # Cross-domain helpers are explicit parameters so Warp sees them as
@@ -261,7 +257,7 @@ def make_raycast_kernels(
         )
         return wp.vec2(sdf, 1.0)
 
-    @warp_func(f"sample_block_grid_rgb_bs{block_size}_cg{int(use_color_grid)}_gs{color_grid_size}")
+    @warp_func(f"sample_block_grid_rgb_bs{block_size}_gs{color_grid_size}")
     def sample_block_grid_rgb(
         tsdf: BlockSparseTSDFWarp,
         world_pos: wp.vec3,
@@ -270,10 +266,7 @@ def make_raycast_kernels(
         by: wp.int32,
         bz: wp.int32,
     ) -> wp.vec4:
-        """Sample weighted RGBW from the optional per-block RGB grid."""
-        if not USE_COLOR_GRID:
-            return wp.vec4(0.0, 0.0, 0.0, 0.0)
-
+        """Sample weighted RGBW from the per-block RGB grid."""
         base = block_key_to_voxel_base(bx, by, bz)
         voxel_f = world_to_continuous_voxel(world_pos)
         local_x = voxel_f[0] - wp.float32(base[0])
@@ -309,12 +302,12 @@ def make_raycast_kernels(
             wp.float32(tsdf.block_grid_rgb[pool_idx, idx, 3]),
         )
 
-    @warp_func(f"sample_rgb_bs{block_size}_cg{int(use_color_grid)}_gs{color_grid_size}")
+    @warp_func(f"sample_rgb_bs{block_size}_gs{color_grid_size}")
     def sample_rgb(
         tsdf: BlockSparseTSDFWarp,
         world_pos: wp.vec3,
     ) -> wp.vec3:
-        """Sample RGB color from grid RGB when enabled, else per-block average."""
+        """Sample RGB color from the nearest RGB-grid node."""
         coords = world_to_block_and_local(world_pos)
         bx = coords[0]
         by = coords[1]
@@ -324,18 +317,16 @@ def make_raycast_kernels(
         if pool_idx < 0:
             return wp.vec3(0.0, 0.0, 0.0)
 
-        if USE_COLOR_GRID:
-            grid_rgbw = sample_block_grid_rgb(tsdf, world_pos, pool_idx, bx, by, bz)
-            grid_w = grid_rgbw[3]
-            if grid_w > wp.float32(1.0e-6):
-                inv_w = wp.float32(255.0) / grid_w
-                return wp.vec3(
-                    wp.clamp(grid_rgbw[0] * inv_w, wp.float32(0.0), wp.float32(255.0)),
-                    wp.clamp(grid_rgbw[1] * inv_w, wp.float32(0.0), wp.float32(255.0)),
-                    wp.clamp(grid_rgbw[2] * inv_w, wp.float32(0.0), wp.float32(255.0)),
-                )
-
-        return compute_avg_rgb_from_block(tsdf.block_rgb, pool_idx)
+        grid_rgbw = sample_block_grid_rgb(tsdf, world_pos, pool_idx, bx, by, bz)
+        grid_w = grid_rgbw[3]
+        if grid_w <= wp.float32(1.0e-6):
+            return wp.vec3(0.0, 0.0, 0.0)
+        inv_w = wp.float32(255.0) / grid_w
+        return wp.vec3(
+            wp.clamp(grid_rgbw[0] * inv_w, wp.float32(0.0), wp.float32(255.0)),
+            wp.clamp(grid_rgbw[1] * inv_w, wp.float32(0.0), wp.float32(255.0)),
+            wp.clamp(grid_rgbw[2] * inv_w, wp.float32(0.0), wp.float32(255.0)),
+        )
 
     @warp_func(f"compute_gradient_bs{block_size}")
     def compute_gradient(
@@ -1308,7 +1299,7 @@ def make_raycast_kernels(
 
         out_sdf[slot] = sdf
 
-        rgb = compute_avg_rgb_uint8_from_block(tsdf.block_rgb, block_idx)
+        rgb = sample_rgb(tsdf, world_pos)
         out_colors[slot, 0] = wp.uint8(rgb[0])
         out_colors[slot, 1] = wp.uint8(rgb[1])
         out_colors[slot, 2] = wp.uint8(rgb[2])

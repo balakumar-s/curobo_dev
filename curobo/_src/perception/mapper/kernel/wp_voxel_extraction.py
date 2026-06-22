@@ -27,11 +27,14 @@ from curobo._src.util.warp import get_warp_device_stream, init_warp
 def _build_block_data_view(tsdf, num_alloc: int) -> BlockDataView:
     """Zero-copy view over per-block storage tensors."""
     return BlockDataView(
-        rgb=tsdf.data.block_rgb,
+        rgb_grid=tsdf.data.block_grid_rgb,
         coords=tsdf.data.block_coords,
         num_allocated=num_alloc,
+        origin=tsdf.data.origin,
         voxel_size=tsdf.config.voxel_size,
         block_size=tsdf.block_size,
+        grid_shape=tsdf.config.grid_shape,
+        color_grid_size=tsdf.data.color_grid_size,
         features=tsdf.data.block_features,
         feature_weight=tsdf.data.block_feature_weight,
         feature_dim=tsdf.data.feature_dim,
@@ -254,8 +257,8 @@ def extract_matching_voxels_block_sparse(
 
     if block_mask.dtype != torch.uint8:
         block_mask = block_mask.to(torch.uint8)
-    if block_mask.device != tsdf.data.block_rgb.device:
-        block_mask = block_mask.to(tsdf.data.block_rgb.device)
+    if block_mask.device != tsdf.data.block_grid_rgb.device:
+        block_mask = block_mask.to(tsdf.data.block_grid_rgb.device)
     if block_mask.shape[0] < tsdf.config.max_blocks:
         raise ValueError(
             f"block_mask must cover max_blocks={tsdf.config.max_blocks} entries, "

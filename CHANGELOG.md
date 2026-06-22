@@ -19,13 +19,23 @@
   `BlockSparseTSDFCfg`, `BlockSparseTSDFIntegratorCfg`, and
   `BlockSparseESDFIntegratorCfg` now expose `block_size`, replacing the
   old module-level `BLOCK_SIZE` constant.
+- Replace mapper per-block RGB storage with a per-block local RGB control
+  grid. `BlockSparseTSDFCfg`, `BlockSparseTSDFIntegratorCfg`, and
+  `BlockSparseESDFIntegratorCfg` now expose `color_grid_size`, a
+  construction-time kernel specialization value in `[1, block_size]`.
+  RGB readout, raycast, mesh, and occupied-voxel extraction sample the
+  nearest color-grid node.
+- Integrate camera RGB into the mapper color grid with weighted bilinear
+  RGB-D sampling. The camera RGB kernel reads pixels as packed `wp.vec3ub`
+  values.
 - Add a cached per-`(block_size, seeding_method)` Warp kernel factory for
   block-sparse mapper kernels. Mapper construction now specializes kernels
   for the selected block size and compiles only the pipeline stages that
   are enabled by configuration.
-- Store per-block RGB and feature accumulators in fp16 and cap their
-  weights with `MapperCfg.accumulator_w_max`. This reduces feature-map
-  memory use and gives old observations EMA-like decay for dynamic scenes.
+- Store mapper color-grid RGB and feature accumulators in fp16 and cap
+  their weights with `MapperCfg.accumulator_w_max`. This reduces
+  feature-map memory use and gives old observations EMA-like decay for
+  dynamic scenes.
 - Add feature-mapping docs, videos, and an interactive getting-started
   example at `curobo/examples/getting_started/feature_mapping.py`.
 - Add polygon-face mesh construction with quad triangulation support.
@@ -109,11 +119,16 @@
 - `Mapper.get_matching_feature_voxels()` now returns `MatchedVoxels`.
   Code that accessed matched voxel fields directly should use
   `matched.voxels`, for example `matched.voxels.centers`.
-- Raw mapper storage fields `tsdf.data.block_rgb`, `block_features`, and
-  `block_feature_weight` are now `torch.float16`. Upcast to `float()` before
-  doing arithmetic on them directly. RGB accumulators are stored normalized
-  to `[0, 1]`; public helper outputs continue to return uint8 colors where
-  documented.
+- Raw mapper RGB storage `tsdf.data.block_rgb` is removed. Use
+  `tsdf.data.block_grid_rgb`, shaped
+  `(max_blocks, color_grid_size ** 3, 4)`, with fp16 normalized RGBW
+  accumulators. `use_color_grid` and `has_color_grid` are also removed; the
+  color grid is always present and `color_grid_size` defines its resolution.
+  `block_features` and `block_feature_weight` remain fp16; upcast to
+  `float()` before doing arithmetic on them directly.
+- Mapper block checkpoints now store `block_grid_rgb` and include
+  `color_grid_size` in metadata. Old checkpoints that contain only
+  `block_rgb` are not supported.
 - Direct imports from removed internal mapper kernel modules such as
   `wp_hash`, `wp_coord`, `wp_raycast`, and `wp_raycast_common` must move to
   the per-instance kernel factory accessors.

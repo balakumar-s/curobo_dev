@@ -145,47 +145,6 @@ def make_hash_kernels(
     def pack_rgb(r: wp.uint8, g: wp.uint8, b: wp.uint8) -> wp.int32:
         return (wp.int32(r) << 16) | (wp.int32(g) << 8) | wp.int32(b)
 
-    @warp_func(f"compute_avg_rgb_from_block_{suffix}")
-    def compute_avg_rgb_from_block(
-        block_rgb: wp.array2d(dtype=wp.float16),
-        pool_idx: wp.int32,
-    ) -> wp.vec3:
-        """Weighted-mean RGB for a block, rescaled to ``[0, 255]``.
-
-        Weighted sums are stored fp16 with RGB pre-normalized to
-        ``[0, 1]`` at the integration site; divide in fp32 and
-        multiply by 255 to match the legacy uint8-scaled output
-        consumers expect.
-        """
-        r_sum = wp.float32(block_rgb[pool_idx, 0])
-        g_sum = wp.float32(block_rgb[pool_idx, 1])
-        b_sum = wp.float32(block_rgb[pool_idx, 2])
-        w = wp.float32(block_rgb[pool_idx, 3])
-        if w < 1e-6:
-            return wp.vec3(0.0, 0.0, 0.0)
-        scale = 255.0 / w
-        r = wp.clamp(r_sum * scale, 0.0, 255.0)
-        g = wp.clamp(g_sum * scale, 0.0, 255.0)
-        b = wp.clamp(b_sum * scale, 0.0, 255.0)
-        return wp.vec3(r, g, b)
-
-    @warp_func(f"compute_avg_rgb_uint8_from_block_{suffix}")
-    def compute_avg_rgb_uint8_from_block(
-        block_rgb: wp.array2d(dtype=wp.float16),
-        pool_idx: wp.int32,
-    ) -> wp.vec3i:
-        r_sum = wp.float32(block_rgb[pool_idx, 0])
-        g_sum = wp.float32(block_rgb[pool_idx, 1])
-        b_sum = wp.float32(block_rgb[pool_idx, 2])
-        w = wp.float32(block_rgb[pool_idx, 3])
-        if w < 1e-6:
-            return wp.vec3i(0, 0, 0)
-        scale = 255.0 / w
-        r = wp.int32(wp.clamp(r_sum * scale, 0.0, 255.0))
-        g = wp.int32(wp.clamp(g_sum * scale, 0.0, 255.0))
-        b = wp.int32(wp.clamp(b_sum * scale, 0.0, 255.0))
-        return wp.vec3i(r, g, b)
-
     # =====================================================================
     # Hash Table Lookup
     # =====================================================================
@@ -473,7 +432,6 @@ def make_hash_kernels(
     @warp_kernel(f"clear_new_blocks_kernel_{suffix}")
     def clear_new_blocks_kernel(
         block_data: wp.array3d(dtype=wp.float16),
-        block_rgb: wp.array2d(dtype=wp.float16),
         new_blocks: wp.array(dtype=wp.int32),
         new_block_count: wp.array(dtype=wp.int32),
         max_blocks: wp.int32,
@@ -490,12 +448,6 @@ def make_hash_kernels(
 
         block_data[pool_idx, local_idx, 0] = wp.float16(0.0)
         block_data[pool_idx, local_idx, 1] = wp.float16(0.0)
-
-        if local_idx == 0:
-            block_rgb[pool_idx, 0] = wp.float16(0.0)
-            block_rgb[pool_idx, 1] = wp.float16(0.0)
-            block_rgb[pool_idx, 2] = wp.float16(0.0)
-            block_rgb[pool_idx, 3] = wp.float16(0.0)
 
     @warp_kernel(f"clear_new_block_features_kernel_{suffix}")
     def clear_new_block_features_kernel(
@@ -534,8 +486,6 @@ def make_hash_kernels(
         "is_valid_block_key": is_valid_block_key,
         "spatial_hash": spatial_hash,
         "pack_rgb": pack_rgb,
-        "compute_avg_rgb_from_block": compute_avg_rgb_from_block,
-        "compute_avg_rgb_uint8_from_block": compute_avg_rgb_uint8_from_block,
         "hash_lookup": hash_lookup,
         "free_list_pop": free_list_pop,
         "free_list_push": free_list_push,

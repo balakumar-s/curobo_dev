@@ -37,7 +37,6 @@ def make_camera_integrate_kernels(
     feature_channels_per_thread: int,
     max_feature_tile_channels: int,
     max_support_pixels_per_block_camera: int,
-    use_color_grid: bool,
     color_grid_size: int,
     pack_key_only,
     unpack_block_key,
@@ -68,7 +67,6 @@ def make_camera_integrate_kernels(
     safe_step = (float(block_size) * float(voxel_size)) / 1.42
     STEP_SIZE = wp.constant(wp.float32(safe_step))
     FEATURE_DIM = wp.constant(wp.int32(feature_dim))
-    USE_COLOR_GRID = wp.constant(bool(use_color_grid))
     COLOR_GRID_SIZE = wp.constant(wp.int32(color_grid_size))
     color_grid_voxels = int(color_grid_size) ** 3
     COLOR_GRID_VOXELS = wp.constant(wp.int32(color_grid_voxels))
@@ -83,7 +81,7 @@ def make_camera_integrate_kernels(
     FEATURE_GRID_WIDTH = wp.constant(wp.int32(feature_grid_width))
     suffix = (
         f"bs{block_size}_cfg"
-        f"{warp_constant_suffix(block_size, feature_dim, num_cameras, image_height, image_width, num_samples, grid_shape, origin_xyz, voxel_size, truncation_distance, feature_grid_shape, feature_channels_per_thread, max_feature_tile_channels, max_support_pixels_per_block_camera, use_color_grid, color_grid_size)}"
+        f"{warp_constant_suffix(block_size, feature_dim, num_cameras, image_height, image_width, num_samples, grid_shape, origin_xyz, voxel_size, truncation_distance, feature_grid_shape, feature_channels_per_thread, max_feature_tile_channels, max_support_pixels_per_block_camera, color_grid_size)}"
     )
 
     # Cross-domain helpers are explicit parameters so Warp sees them as
@@ -374,7 +372,6 @@ def make_camera_integrate_kernels(
         clear_pool_indices: wp.array(dtype=wp.int32),
         clear_count: wp.array(dtype=wp.int32),
         block_data: wp.array3d(dtype=wp.float16),
-        block_rgb: wp.array2d(dtype=wp.float16),
         block_sums: wp.array(dtype=wp.float32),
         max_blocks: wp.int32,
     ):
@@ -394,8 +391,6 @@ def make_camera_integrate_kernels(
         block_data[pool_idx, local_idx, 0] = wp.float16(0.0)
         block_data[pool_idx, local_idx, 1] = wp.float16(0.0)
 
-        if local_idx < wp.int32(4): # 0, 1, 2, 3
-            block_rgb[pool_idx, local_idx] = wp.float16(0.0)
         if local_idx == wp.int32(0):
             block_sums[pool_idx] = wp.float32(0.0)
 
@@ -550,7 +545,7 @@ def make_camera_integrate_kernels(
         cam_positions: wp.array2d(dtype=wp.float32),
         cam_quaternions: wp.array2d(dtype=wp.float32),
         depth_images: wp.array3d(dtype=wp.float32),
-        rgb_images_flat: wp.array3d(dtype=wp.uint8),
+        rgb_images_flat: wp.array2d(dtype=wp.vec3ub),
         depth_min: float,
         depth_max: float,
         block_coords: wp.array(dtype=wp.int32),
@@ -559,8 +554,6 @@ def make_camera_integrate_kernels(
         """Project each RGB-grid node into cameras and integrate weighted RGBW."""
         vis_idx, node_idx = wp.tid()
         if vis_idx >= n_visible or node_idx >= COLOR_GRID_VOXELS:
-            return
-        if not USE_COLOR_GRID:
             return
 
         pool_idx = visible_pool_indices[vis_idx]
@@ -635,37 +628,151 @@ def make_camera_integrate_kernels(
                 u = fx * node_cam[0] / z_cam + cx_i
                 v = fy * node_cam[1] / z_cam + cy_i
 
-                px = wp.int32(u)
-                py = wp.int32(v)
+                coverage = (fx * VOXEL_SIZE / z_cam) * (fy * VOXEL_SIZE / z_cam)
+                coverage_weight = wp.max(coverage, 1.0)
 
-                if px >= 0 and px < IMAGE_WIDTH and py >= 0 and py < IMAGE_HEIGHT:
-                    depth = depth_images[cam_i, py, px]
-                    if depth >= depth_min and depth <= depth_max:
-                        sdf = depth - z_cam
-                        if sdf >= -TRUNCATION_DIST and sdf <= TRUNCATION_DIST:
-                            base_weight = compute_tsdf_weight(depth, VOXEL_SIZE)
-                            coverage = (fx * VOXEL_SIZE / z_cam) * (fy * VOXEL_SIZE / z_cam)
-                            weight = base_weight * wp.max(coverage, 1.0)
-                            rgb_row = cam_i * IMAGE_HEIGHT + py
+                if (
+                    u >= wp.float32(0.0)
+                    and u <= wp.float32(IMAGE_WIDTH - wp.int32(1))
+                    and v >= wp.float32(0.0)
+                    and v <= wp.float32(IMAGE_HEIGHT - wp.int32(1))
+                ):
+                    px0 = wp.int32(wp.floor(u))
+                    py0 = wp.int32(wp.floor(v))
+                    px1 = wp.min(px0 + wp.int32(1), IMAGE_WIDTH - wp.int32(1))
+                    py1 = wp.min(py0 + wp.int32(1), IMAGE_HEIGHT - wp.int32(1))
+                    tx = u - wp.float32(px0)
+                    ty = v - wp.float32(py0)
+                    wx0 = wp.float32(1.0) - tx
+                    wy0 = wp.float32(1.0) - ty
+                    w00 = wx0 * wy0
+                    w10 = tx * wy0
+                    w01 = wx0 * ty
+                    w11 = tx * ty
+
+                    depth00 = depth_images[cam_i, py0, px0]
+                    if depth00 >= depth_min and depth00 <= depth_max:
+                        sdf00 = depth00 - z_cam
+                        if sdf00 >= -TRUNCATION_DIST and sdf00 <= TRUNCATION_DIST:
+                            weight00 = (
+                                w00
+                                * compute_tsdf_weight(depth00, VOXEL_SIZE)
+                                * coverage_weight
+                            )
+                            row00 = cam_i * IMAGE_HEIGHT + py0
+                            rgb00 = rgb_images_flat[row00, px0]
                             total_r = (
                                 total_r
-                                + wp.float32(rgb_images_flat[rgb_row, px, 0])
+                                + wp.float32(rgb00[0])
                                 * inv_255
-                                * weight
+                                * weight00
                             )
                             total_g = (
                                 total_g
-                                + wp.float32(rgb_images_flat[rgb_row, px, 1])
+                                + wp.float32(rgb00[1])
                                 * inv_255
-                                * weight
+                                * weight00
                             )
                             total_b = (
                                 total_b
-                                + wp.float32(rgb_images_flat[rgb_row, px, 2])
+                                + wp.float32(rgb00[2])
                                 * inv_255
-                                * weight
+                                * weight00
                             )
-                            total_w = total_w + weight
+                            total_w = total_w + weight00
+
+                    depth10 = depth_images[cam_i, py0, px1]
+                    if depth10 >= depth_min and depth10 <= depth_max:
+                        sdf10 = depth10 - z_cam
+                        if sdf10 >= -TRUNCATION_DIST and sdf10 <= TRUNCATION_DIST:
+                            weight10 = (
+                                w10
+                                * compute_tsdf_weight(depth10, VOXEL_SIZE)
+                                * coverage_weight
+                            )
+                            row10 = cam_i * IMAGE_HEIGHT + py0
+                            rgb10 = rgb_images_flat[row10, px1]
+                            total_r = (
+                                total_r
+                                + wp.float32(rgb10[0])
+                                * inv_255
+                                * weight10
+                            )
+                            total_g = (
+                                total_g
+                                + wp.float32(rgb10[1])
+                                * inv_255
+                                * weight10
+                            )
+                            total_b = (
+                                total_b
+                                + wp.float32(rgb10[2])
+                                * inv_255
+                                * weight10
+                            )
+                            total_w = total_w + weight10
+
+                    depth01 = depth_images[cam_i, py1, px0]
+                    if depth01 >= depth_min and depth01 <= depth_max:
+                        sdf01 = depth01 - z_cam
+                        if sdf01 >= -TRUNCATION_DIST and sdf01 <= TRUNCATION_DIST:
+                            weight01 = (
+                                w01
+                                * compute_tsdf_weight(depth01, VOXEL_SIZE)
+                                * coverage_weight
+                            )
+                            row01 = cam_i * IMAGE_HEIGHT + py1
+                            rgb01 = rgb_images_flat[row01, px0]
+                            total_r = (
+                                total_r
+                                + wp.float32(rgb01[0])
+                                * inv_255
+                                * weight01
+                            )
+                            total_g = (
+                                total_g
+                                + wp.float32(rgb01[1])
+                                * inv_255
+                                * weight01
+                            )
+                            total_b = (
+                                total_b
+                                + wp.float32(rgb01[2])
+                                * inv_255
+                                * weight01
+                            )
+                            total_w = total_w + weight01
+
+                    depth11 = depth_images[cam_i, py1, px1]
+                    if depth11 >= depth_min and depth11 <= depth_max:
+                        sdf11 = depth11 - z_cam
+                        if sdf11 >= -TRUNCATION_DIST and sdf11 <= TRUNCATION_DIST:
+                            weight11 = (
+                                w11
+                                * compute_tsdf_weight(depth11, VOXEL_SIZE)
+                                * coverage_weight
+                            )
+                            row11 = cam_i * IMAGE_HEIGHT + py1
+                            rgb11 = rgb_images_flat[row11, px1]
+                            total_r = (
+                                total_r
+                                + wp.float32(rgb11[0])
+                                * inv_255
+                                * weight11
+                            )
+                            total_g = (
+                                total_g
+                                + wp.float32(rgb11[1])
+                                * inv_255
+                                * weight11
+                            )
+                            total_b = (
+                                total_b
+                                + wp.float32(rgb11[2])
+                                * inv_255
+                                * weight11
+                            )
+                            total_w = total_w + weight11
 
         if total_w > wp.float32(0.0):
             old_r = wp.float32(block_grid_rgb[pool_idx, node_idx, 0])
@@ -676,59 +783,6 @@ def make_camera_integrate_kernels(
             block_grid_rgb[pool_idx, node_idx, 1] = wp.float16(old_g + total_g)
             block_grid_rgb[pool_idx, node_idx, 2] = wp.float16(old_b + total_b)
             block_grid_rgb[pool_idx, node_idx, 3] = wp.float16(old_w + total_w)
-
-    @warp_kernel(
-        f"integrate_block_rgb_from_support_kernel_{suffix}_sc{support_capacity}"
-    )
-    def integrate_block_rgb_from_support_kernel(
-        visible_pool_indices: wp.array(dtype=wp.int32),
-        n_visible: wp.int32,
-        support_counts: wp.array2d(dtype=wp.int32),
-        support_pixels: wp.array3d(dtype=wp.int32),
-        rgb_images_flat: wp.array3d(dtype=wp.uint8),
-        block_rgb: wp.array2d(dtype=wp.float16),
-    ):
-        """Per-block RGB aggregation from allocation-time support pixels."""
-        vis_idx, cam_i = wp.tid()
-        if vis_idx >= n_visible:
-            return
-
-        pool_idx = visible_pool_indices[vis_idx]
-        if pool_idx < wp.int32(0):
-            return
-
-        count = support_counts[vis_idx, cam_i]
-        if count > SUPPORT_CAPACITY:
-            count = SUPPORT_CAPACITY
-        if count <= wp.int32(0):
-            return
-
-        inv_255 = wp.float32(1.0 / 255.0)
-        total_r = wp.float32(0.0)
-        total_g = wp.float32(0.0)
-        total_b = wp.float32(0.0)
-
-        for k in range(support_capacity):
-            if k < count:
-                pixel_idx = support_pixels[vis_idx, cam_i, k]
-                py = pixel_idx // IMAGE_WIDTH
-                px = pixel_idx - py * IMAGE_WIDTH
-                if (
-                    py >= wp.int32(0)
-                    and py < IMAGE_HEIGHT
-                    and px >= wp.int32(0)
-                    and px < IMAGE_WIDTH
-                ):
-                    rgb_row = cam_i * IMAGE_HEIGHT + py
-                    total_r = total_r + wp.float32(rgb_images_flat[rgb_row, px, 0]) * inv_255
-                    total_g = total_g + wp.float32(rgb_images_flat[rgb_row, px, 1]) * inv_255
-                    total_b = total_b + wp.float32(rgb_images_flat[rgb_row, px, 2]) * inv_255
-
-        weight = wp.float32(count)
-        wp.atomic_add(block_rgb, pool_idx, 0, wp.float16(total_r))
-        wp.atomic_add(block_rgb, pool_idx, 1, wp.float16(total_g))
-        wp.atomic_add(block_rgb, pool_idx, 2, wp.float16(total_b))
-        wp.atomic_add(block_rgb, pool_idx, 3, wp.float16(weight))
 
     @warp_kernel(
         f"integrate_features_from_support_grouped_kernel_{suffix}_fcpt"
@@ -901,7 +955,6 @@ def make_camera_integrate_kernels(
         "clear_block_grid_rgb_by_pool_kernel": clear_block_grid_rgb_by_pool_kernel,
         "clear_block_features_by_pool_kernel": clear_block_features_by_pool_kernel,
         "integrate_voxels_kernel": integrate_voxels_kernel,
-        "integrate_block_rgb_from_support_kernel": integrate_block_rgb_from_support_kernel,
         "integrate_block_grid_rgb_kernel": integrate_block_grid_rgb_kernel,
         "integrate_features_from_support_grouped_kernel": (
             integrate_features_from_support_grouped_kernel
@@ -909,6 +962,5 @@ def make_camera_integrate_kernels(
         "integrate_features_from_support_tiled_kernel": (
             integrate_features_from_support_tiled_kernel
         ),
-        "integrate_block_rgb_kernel": integrate_block_rgb_from_support_kernel,
         "integrate_features_grouped_kernel": integrate_features_from_support_grouped_kernel,
     }

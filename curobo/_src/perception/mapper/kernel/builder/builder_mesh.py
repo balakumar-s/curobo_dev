@@ -34,7 +34,6 @@ def make_mesh_kernels(
     image_height: int = 1,
     image_width: int = 1,
     hash_lookup,
-    compute_avg_rgb_uint8_from_block,
     sample_rgb,
     sample_voxel,
     sample_tsdf_trilinear,
@@ -42,14 +41,12 @@ def make_mesh_kernels(
     compute_gradient_nearest,
     block_grid_to_key_coords,
     block_key_to_voxel_base,
-    use_color_grid: bool = False,
 ) -> dict[str, object]:
     """Build block-sparse marching-cubes kernels."""
     BS = wp.constant(block_size)
     NUM_CAMERAS = wp.constant(num_cameras)
     IMAGE_HEIGHT = wp.constant(image_height)
     IMAGE_WIDTH = wp.constant(image_width)
-    USE_COLOR_GRID = wp.constant(bool(use_color_grid))
 
     # Cross-domain helpers are explicit parameters so Warp sees them as
     # local closure bindings when compiling dependent functions.
@@ -1099,7 +1096,7 @@ def make_mesh_kernels(
             * tsdf.voxel_size
         )
 
-        rgb = compute_avg_rgb_uint8_from_block(tsdf.block_rgb, block_idx)
+        rgb = sample_rgb(tsdf, (p0 + p6) * wp.float32(0.5))
         color = wp.vec3ub(wp.uint8(rgb[0]), wp.uint8(rgb[1]), wp.uint8(rgb[2]))
 
         tri_base = tri_offsets[tid]
@@ -1304,7 +1301,7 @@ def make_mesh_kernels(
             * tsdf.voxel_size
         )
 
-        rgb = compute_avg_rgb_uint8_from_block(tsdf.block_rgb, block_idx)
+        rgb = sample_rgb(tsdf, (p0 + p6) * wp.float32(0.5))
         color = wp.vec3ub(wp.uint8(rgb[0]), wp.uint8(rgb[1]), wp.uint8(rgb[2]))
 
         table_offset = cube_config * 16
@@ -1610,7 +1607,7 @@ def make_mesh_kernels(
 
             color_bs1 = wp.vec3ub(wp.uint8(0), wp.uint8(0), wp.uint8(0))
             if write_colors_bs1:
-                rgb_bs1 = compute_avg_rgb_uint8_from_block(tsdf.block_rgb, block_idx)
+                rgb_bs1 = sample_rgb(tsdf, (p0_bs1 + p6_bs1) * wp.float32(0.5))
                 color_bs1 = wp.vec3ub(
                     wp.uint8(rgb_bs1[0]), wp.uint8(rgb_bs1[1]), wp.uint8(rgb_bs1[2])
                 )
@@ -1924,7 +1921,7 @@ def make_mesh_kernels(
 
         color = wp.vec3ub(wp.uint8(0), wp.uint8(0), wp.uint8(0))
         if write_colors:
-            rgb = compute_avg_rgb_uint8_from_block(tsdf.block_rgb, block_idx)
+            rgb = sample_rgb(tsdf, (p0 + p6) * wp.float32(0.5))
             color = wp.vec3ub(wp.uint8(rgb[0]), wp.uint8(rgb[1]), wp.uint8(rgb[2]))
 
         for t in range(5):
@@ -2396,11 +2393,10 @@ def make_mesh_kernels(
 
             color_g = wp.vec3ub(wp.uint8(128), wp.uint8(128), wp.uint8(128))
             if use_voxel_colors != wp.int32(0):
-                if not USE_COLOR_GRID:
-                    rgb_g = compute_avg_rgb_uint8_from_block(tsdf.block_rgb, block_idx)
-                    color_g = wp.vec3ub(
-                        wp.uint8(rgb_g[0]), wp.uint8(rgb_g[1]), wp.uint8(rgb_g[2])
-                    )
+                rgb_g = sample_rgb(tsdf, (p0_g + p6_g) * wp.float32(0.5))
+                color_g = wp.vec3ub(
+                    wp.uint8(rgb_g[0]), wp.uint8(rgb_g[1]), wp.uint8(rgb_g[2])
+                )
 
             for t in range(5):
                 if wp.int32(t) >= write_tris_g:
@@ -2483,28 +2479,23 @@ def make_mesh_kernels(
                     triangles[vertex_id0_g] = vertex_id0_g
                     triangles[vertex_id1_g] = vertex_id1_g
                     triangles[vertex_id2_g] = vertex_id2_g
-                if USE_COLOR_GRID:
-                    if use_voxel_colors == wp.int32(0):
-                        colors[vertex_id0_g] = color_g
-                        colors[vertex_id1_g] = color_g
-                        colors[vertex_id2_g] = color_g
-                        continue
-                    c0_g = sample_rgb(tsdf, v0_g)
-                    c1_g = sample_rgb(tsdf, v1_g)
-                    c2_g = sample_rgb(tsdf, v2_g)
-                    colors[vertex_id0_g] = wp.vec3ub(
-                        wp.uint8(c0_g[0]), wp.uint8(c0_g[1]), wp.uint8(c0_g[2])
-                    )
-                    colors[vertex_id1_g] = wp.vec3ub(
-                        wp.uint8(c1_g[0]), wp.uint8(c1_g[1]), wp.uint8(c1_g[2])
-                    )
-                    colors[vertex_id2_g] = wp.vec3ub(
-                        wp.uint8(c2_g[0]), wp.uint8(c2_g[1]), wp.uint8(c2_g[2])
-                    )
-                else:
+                if use_voxel_colors == wp.int32(0):
                     colors[vertex_id0_g] = color_g
                     colors[vertex_id1_g] = color_g
                     colors[vertex_id2_g] = color_g
+                    continue
+                c0_g = sample_rgb(tsdf, v0_g)
+                c1_g = sample_rgb(tsdf, v1_g)
+                c2_g = sample_rgb(tsdf, v2_g)
+                colors[vertex_id0_g] = wp.vec3ub(
+                    wp.uint8(c0_g[0]), wp.uint8(c0_g[1]), wp.uint8(c0_g[2])
+                )
+                colors[vertex_id1_g] = wp.vec3ub(
+                    wp.uint8(c1_g[0]), wp.uint8(c1_g[1]), wp.uint8(c1_g[2])
+                )
+                colors[vertex_id2_g] = wp.vec3ub(
+                    wp.uint8(c2_g[0]), wp.uint8(c2_g[1]), wp.uint8(c2_g[2])
+                )
 
             return
 
@@ -2728,9 +2719,8 @@ def make_mesh_kernels(
 
         color = wp.vec3ub(wp.uint8(128), wp.uint8(128), wp.uint8(128))
         if use_voxel_colors != wp.int32(0):
-            if not USE_COLOR_GRID:
-                rgb = compute_avg_rgb_uint8_from_block(tsdf.block_rgb, block_idx)
-                color = wp.vec3ub(wp.uint8(rgb[0]), wp.uint8(rgb[1]), wp.uint8(rgb[2]))
+            rgb = sample_rgb(tsdf, (p0 + p6) * wp.float32(0.5))
+            color = wp.vec3ub(wp.uint8(rgb[0]), wp.uint8(rgb[1]), wp.uint8(rgb[2]))
 
         for t in range(5):
             if wp.int32(t) >= write_tris:
@@ -2813,28 +2803,23 @@ def make_mesh_kernels(
                 triangles[vertex_id0] = vertex_id0
                 triangles[vertex_id1] = vertex_id1
                 triangles[vertex_id2] = vertex_id2
-            if USE_COLOR_GRID:
-                if use_voxel_colors == wp.int32(0):
-                    colors[vertex_id0] = color
-                    colors[vertex_id1] = color
-                    colors[vertex_id2] = color
-                    continue
-                c0 = sample_rgb(tsdf, v0)
-                c1 = sample_rgb(tsdf, v1)
-                c2 = sample_rgb(tsdf, v2)
-                colors[vertex_id0] = wp.vec3ub(
-                    wp.uint8(c0[0]), wp.uint8(c0[1]), wp.uint8(c0[2])
-                )
-                colors[vertex_id1] = wp.vec3ub(
-                    wp.uint8(c1[0]), wp.uint8(c1[1]), wp.uint8(c1[2])
-                )
-                colors[vertex_id2] = wp.vec3ub(
-                    wp.uint8(c2[0]), wp.uint8(c2[1]), wp.uint8(c2[2])
-                )
-            else:
+            if use_voxel_colors == wp.int32(0):
                 colors[vertex_id0] = color
                 colors[vertex_id1] = color
                 colors[vertex_id2] = color
+                continue
+            c0 = sample_rgb(tsdf, v0)
+            c1 = sample_rgb(tsdf, v1)
+            c2 = sample_rgb(tsdf, v2)
+            colors[vertex_id0] = wp.vec3ub(
+                wp.uint8(c0[0]), wp.uint8(c0[1]), wp.uint8(c0[2])
+            )
+            colors[vertex_id1] = wp.vec3ub(
+                wp.uint8(c1[0]), wp.uint8(c1[1]), wp.uint8(c1[2])
+            )
+            colors[vertex_id2] = wp.vec3ub(
+                wp.uint8(c2[0]), wp.uint8(c2[1]), wp.uint8(c2[2])
+            )
 
     # =====================================================================
     # Projective texture mapping for fast triangle-list meshes
@@ -3119,14 +3104,10 @@ def make_mesh_kernels(
             colors[tid] = wp.vec3ub(wp.uint8(128), wp.uint8(128), wp.uint8(128))
             return
 
-        if USE_COLOR_GRID:
-            rgb_grid = sample_rgb(tsdf, pos)
-            colors[tid] = wp.vec3ub(
-                wp.uint8(rgb_grid[0]), wp.uint8(rgb_grid[1]), wp.uint8(rgb_grid[2])
-            )
-        else:
-            rgb = compute_avg_rgb_uint8_from_block(tsdf.block_rgb, pool_idx)
-            colors[tid] = wp.vec3ub(wp.uint8(rgb[0]), wp.uint8(rgb[1]), wp.uint8(rgb[2]))
+        rgb_grid = sample_rgb(tsdf, pos)
+        colors[tid] = wp.vec3ub(
+            wp.uint8(rgb_grid[0]), wp.uint8(rgb_grid[1]), wp.uint8(rgb_grid[2])
+        )
 
     # Expose kernels on the instance.
     return {

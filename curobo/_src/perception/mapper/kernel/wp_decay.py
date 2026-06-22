@@ -47,9 +47,7 @@ def decay_and_recycle(
 
     if decay_factor < 1.0:
         tsdf.data.block_data[:num_blocks].mul_(decay_factor)
-        tsdf.data.block_rgb[:num_blocks].mul_(decay_factor)
-        if tsdf.data.has_color_grid:
-            tsdf.data.block_grid_rgb[:num_blocks].mul_(decay_factor)
+        tsdf.data.block_grid_rgb[:num_blocks].mul_(decay_factor)
         if tsdf.data.has_features:
             tsdf.data.block_features[:num_blocks].mul_(decay_factor)
             tsdf.data.block_feature_weight[:num_blocks].mul_(decay_factor)
@@ -127,9 +125,7 @@ def apply_decay_from_frustum_flags(
         block_data = tsdf.data.block_data[:n]
         if time_decay < 1.0:
             block_data.mul_(time_decay)
-            tsdf.data.block_rgb[:n].mul_(time_decay)
-            if tsdf.data.has_color_grid:
-                tsdf.data.block_grid_rgb[:n].mul_(time_decay)
+            tsdf.data.block_grid_rgb[:n].mul_(time_decay)
             if tsdf.data.has_features:
                 tsdf.data.block_features[:n].mul_(time_decay)
                 tsdf.data.block_feature_weight[:n].mul_(time_decay)
@@ -143,9 +139,7 @@ def apply_decay_from_frustum_flags(
     factor.masked_fill_(frustum_flags[:n] > 0, time_decay * frustum_decay)
 
     tsdf.data.block_data[:n].mul_(factor.view(n, 1, 1))
-    tsdf.data.block_rgb[:n].mul_(factor.view(n, 1))
-    if tsdf.data.has_color_grid:
-        tsdf.data.block_grid_rgb[:n].mul_(factor.view(n, 1, 1))
+    tsdf.data.block_grid_rgb[:n].mul_(factor.view(n, 1, 1))
     if tsdf.data.has_features:
         tsdf.data.block_features[:n].mul_(factor.view(n, 1))
         tsdf.data.block_feature_weight[:n].mul_(factor)

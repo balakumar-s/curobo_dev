@@ -2,16 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-"""Post-frame per-block accumulator rescale kernel, per-``block_size`` builder.
+"""Post-frame accumulator rescale kernels, per-``block_size`` builder.
 
-The fp16 per-block accumulators (``block_rgb``, ``block_features``,
-``block_feature_weight``) grow monotonically across frames as atomic
-adds accumulate weighted pixel contributions. Left unbounded, the
-running sum eventually exceeds fp16's finite range (65504) and
-saturates to ``inf``. This builder adds a post-integration pass that
-caps each per-block weight at ``w_max`` and scales the weighted-sum
-channels proportionally so the mean ``sum / weight`` is preserved
-while magnitudes stay bounded.
+The fp16 accumulators (``block_grid_rgb``, ``block_features``, and
+``block_feature_weight``) grow monotonically across frames as weighted
+pixel contributions accumulate. Left unbounded, the running sum
+eventually exceeds fp16's finite range (65504) and saturates to
+``inf``. This builder adds post-integration passes that cap each
+weight at ``w_max`` and scale weighted-sum channels proportionally so
+the mean ``sum / weight`` is preserved while magnitudes stay bounded.
 
 The cap also gives the mapper EMA semantics: old observations decay at
 a rate set by ``w_max / mean_per_frame_weight``. This is desirable for
@@ -35,12 +34,10 @@ def make_rescale_kernels(
     block_size: int,
     *,
     feature_dim: int,
-    use_color_grid: bool = False,
     color_grid_size: int = 1,
 ) -> dict[str, object]:
     """Build per-block accumulator rescale kernels."""
     FEATURE_DIM = wp.constant(wp.int32(feature_dim))
-    USE_COLOR_GRID = wp.constant(bool(use_color_grid))
     color_grid_voxels = int(color_grid_size) ** 3
     COLOR_GRID_VOXELS = wp.constant(wp.int32(color_grid_voxels))
     COLOR_GRID_RGB_CELLS = wp.constant(wp.int32(color_grid_voxels * 3))
@@ -52,21 +49,11 @@ def make_rescale_kernels(
         w_max: wp.float32,
         block_features: wp.array2d(dtype=wp.float16),
         block_feature_weight: wp.array(dtype=wp.float16),
-        block_rgb: wp.array2d(dtype=wp.float16),
     ):
-        """Cap per-block weights at ``w_max``; scale sums proportionally.
+        """Cap per-block feature weights at ``w_max``; scale sums proportionally.
 
-        Launch with ``dim = (n_visible, n_channels)`` where
-        ``n_channels = max(3, feature_dim)`` — one thread per
-        ``(visible_block, channel)`` pair. Within a warp threads
-        share ``pool_idx`` and stride consecutive ``ch`` slots, so
-        ``block_features[pool_idx, ch]`` loads are coalesced and
-        the per-block weights ``w_rgb`` / ``w_f`` broadcast.
-
-        ``block_rgb`` and ``block_features`` track independent
-        weights (the feature kernel aggregates over a footprint bbox
-        while RGB uses per-voxel pixel coverage), so cap each
-        independently.
+        Launch with ``dim = (n_visible, feature_dim)`` — one thread per
+        ``(visible_block, feature_channel)`` pair.
         """
         vis_idx, ch = wp.tid()
 
@@ -85,18 +72,8 @@ def make_rescale_kernels(
                 if ch == 0:
                     block_feature_weight[pool_idx] = wp.float16(w_max)
 
-        if ch < 3:
-            rgb_weight = wp.float32(block_rgb[pool_idx, 3])
-            if rgb_weight > w_max:
-                current_rgb = wp.float32(block_rgb[pool_idx, ch])
-                s = w_max / rgb_weight
-                scaled_rgb = current_rgb * s
-                block_rgb[pool_idx, ch] = wp.float16(scaled_rgb)
-                if ch == 0:
-                    block_rgb[pool_idx, 3] = wp.float16(w_max)
-
     @warp_kernel(
-        f"rescale_block_grid_rgb_kernel_bs{block_size}_cg{int(use_color_grid)}_gs{color_grid_size}"
+        f"rescale_block_grid_rgb_kernel_bs{block_size}_gs{color_grid_size}"
     )
     def rescale_block_grid_rgb_kernel(
         visible_pool_indices: wp.array(dtype=wp.int32),
@@ -107,8 +84,6 @@ def make_rescale_kernels(
         """Cap per-node RGB grid weights at ``w_max`` while preserving means."""
         vis_idx, cell_idx = wp.tid()
         if vis_idx >= n_visible or cell_idx >= COLOR_GRID_RGB_CELLS:
-            return
-        if not USE_COLOR_GRID:
             return
 
         pool_idx = visible_pool_indices[vis_idx]

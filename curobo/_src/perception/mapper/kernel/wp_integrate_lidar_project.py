@@ -228,7 +228,6 @@ class LidarProjectIntegrator:
             dim=(max_clearable, block_voxels),
             inputs=[
                 data.block_data,
-                data.block_rgb,
                 data.new_blocks,
                 data.new_block_count,
                 tsdf.config.max_blocks,
@@ -237,6 +236,20 @@ class LidarProjectIntegrator:
             stream=stream,
         )
         self._timer_stop("clear_new_blocks_kernel")
+        self._timer_start()
+        wp.launch(
+            kernels.clear_new_block_grid_rgb_kernel,
+            dim=(max_clearable, kernels.color_grid_voxels * 4),
+            inputs=[
+                data.block_grid_rgb,
+                data.new_blocks,
+                data.new_block_count,
+                tsdf.config.max_blocks,
+            ],
+            device=device,
+            stream=stream,
+        )
+        self._timer_stop("clear_new_block_grid_rgb_kernel")
         if tsdf.data.has_features:
             self._timer_start()
             wp.launch(
@@ -391,20 +404,20 @@ class LidarProjectIntegrator:
         )
         self._timer_start()
         wp.launch(
-            kernels.lidar_integrate_block_rgb_from_support_kernel,
-            dim=(num_visible_blocks, self.lidar_num_sensors),
+            kernels.lidar_integrate_block_grid_rgb_from_support_kernel,
+            dim=(num_visible_blocks, self.lidar_num_sensors, kernels.color_grid_voxels),
             inputs=[
                 wp.from_torch(self.pool_indices),
                 num_visible_blocks,
                 wp.from_torch(self.support_counts),
                 wp.from_torch(self.support_pixels),
                 wp.from_torch(rgb_flat, dtype=wp.uint8),
-                data.block_rgb,
+                data.block_grid_rgb,
             ],
             device=device,
             stream=stream,
         )
-        self._timer_stop("lidar_integrate_block_rgb_from_support_kernel")
+        self._timer_stop("lidar_integrate_block_grid_rgb_from_support_kernel")
 
         feature_dim_cfg = tsdf.data.feature_dim if tsdf.data.has_features else 0
         if feature_grid is not None and not tsdf.data.has_features:
@@ -462,20 +475,34 @@ class LidarProjectIntegrator:
                 feature_kernel_name = "lidar_integrate_features_from_support_grouped_kernel"
             self._timer_stop(feature_kernel_name)
 
+        if tsdf.data.has_features:
+            self._timer_start()
+            wp.launch(
+                kernels.rescale_block_accumulators_kernel,
+                dim=(num_visible_blocks, kernels.feature_dim),
+                inputs=[
+                    wp.from_torch(self.pool_indices),
+                    num_visible_blocks,
+                    float(tsdf.config.accumulator_w_max),
+                    data.block_features,
+                    data.block_feature_weight,
+                ],
+                device=device,
+                stream=stream,
+            )
+            self._timer_stop("rescale_block_accumulators_kernel")
+
         self._timer_start()
-        n_channels = max(3, kernels.feature_dim)
         wp.launch(
-            kernels.rescale_block_accumulators_kernel,
-            dim=(num_visible_blocks, n_channels),
+            kernels.rescale_block_grid_rgb_kernel,
+            dim=(num_visible_blocks, kernels.color_grid_voxels * 3),
             inputs=[
                 wp.from_torch(self.pool_indices),
                 num_visible_blocks,
                 float(tsdf.config.accumulator_w_max),
-                data.block_features,
-                data.block_feature_weight,
-                data.block_rgb,
+                data.block_grid_rgb,
             ],
             device=device,
             stream=stream,
         )
-        self._timer_stop("rescale_block_accumulators_kernel")
+        self._timer_stop("rescale_block_grid_rgb_kernel")

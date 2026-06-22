@@ -31,6 +31,7 @@ def make_lidar_integrate_kernels(
     feature_channels_per_thread: int,
     max_feature_tile_channels: int,
     max_support_pixels_per_block_lidar: int,
+    color_grid_size: int,
     pack_key_only,
     unpack_block_key,
     hash_lookup,
@@ -54,6 +55,8 @@ def make_lidar_integrate_kernels(
     safe_step = (float(block_size) * float(voxel_size)) / 1.42
     STEP_SIZE = wp.constant(wp.float32(safe_step))
     FEATURE_DIM = wp.constant(wp.int32(feature_dim))
+    color_grid_voxels = int(color_grid_size) ** 3
+    COLOR_GRID_VOXELS = wp.constant(wp.int32(color_grid_voxels))
     if lidar_feature_grid_shape is None:
         lidar_feature_grid_height = 1
         lidar_feature_grid_width = 1
@@ -69,7 +72,7 @@ def make_lidar_integrate_kernels(
     SUPPORT_CAPACITY = wp.constant(support_capacity)
     suffix = (
         f"bs{block_size}_cfg"
-        f"{warp_constant_suffix(block_size, feature_dim, lidar_num_sensors, lidar_image_height, lidar_image_width, num_samples, grid_shape, origin_xyz, voxel_size, truncation_distance, lidar_feature_grid_shape, feature_channels_per_thread, max_feature_tile_channels, max_support_pixels_per_block_lidar)}"
+        f"{warp_constant_suffix(block_size, feature_dim, lidar_num_sensors, lidar_image_height, lidar_image_width, num_samples, grid_shape, origin_xyz, voxel_size, truncation_distance, lidar_feature_grid_shape, feature_channels_per_thread, max_feature_tile_channels, max_support_pixels_per_block_lidar, color_grid_size)}"
     )
 
     @wp.func
@@ -467,18 +470,18 @@ def make_lidar_integrate_kernels(
             block_data[pool_idx, local_idx, 1] = wp.float16(old_w + total_w)
 
     @warp_kernel(
-        f"lidar_integrate_block_rgb_from_support_kernel_{suffix}_sc{support_capacity}"
+        f"lidar_integrate_block_grid_rgb_from_support_kernel_{suffix}_sc{support_capacity}"
     )
-    def lidar_integrate_block_rgb_from_support_kernel(
+    def lidar_integrate_block_grid_rgb_from_support_kernel(
         visible_pool_indices: wp.array(dtype=wp.int32),
         n_visible: wp.int32,
         support_counts: wp.array2d(dtype=wp.int32),
         support_pixels: wp.array3d(dtype=wp.int32),
         rgb_images_flat: wp.array3d(dtype=wp.uint8),
-        block_rgb: wp.array2d(dtype=wp.float16),
+        block_grid_rgb: wp.array3d(dtype=wp.float16),
     ):
-        vis_idx, lidar_i = wp.tid()
-        if vis_idx >= n_visible:
+        vis_idx, lidar_i, node_idx = wp.tid()
+        if vis_idx >= n_visible or node_idx >= COLOR_GRID_VOXELS:
             return
         pool_idx = visible_pool_indices[vis_idx]
         if pool_idx < wp.int32(0):
@@ -504,14 +507,16 @@ def make_lidar_integrate_kernels(
                 total_g = total_g + wp.float32(rgb_images_flat[row, px, 1]) * inv_255
                 total_b = total_b + wp.float32(rgb_images_flat[row, px, 2]) * inv_255
 
-        old_r = wp.float32(block_rgb[pool_idx, 0])
-        old_g = wp.float32(block_rgb[pool_idx, 1])
-        old_b = wp.float32(block_rgb[pool_idx, 2])
-        old_w = wp.float32(block_rgb[pool_idx, 3])
-        block_rgb[pool_idx, 0] = wp.float16(old_r + total_r)
-        block_rgb[pool_idx, 1] = wp.float16(old_g + total_g)
-        block_rgb[pool_idx, 2] = wp.float16(old_b + total_b)
-        block_rgb[pool_idx, 3] = wp.float16(old_w + wp.float32(count))
+        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 0, wp.float16(total_r))
+        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 1, wp.float16(total_g))
+        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 2, wp.float16(total_b))
+        wp.atomic_add(
+            block_grid_rgb,
+            pool_idx,
+            node_idx,
+            3,
+            wp.float16(wp.float32(count)),
+        )
 
     @warp_kernel(
         f"lidar_integrate_features_from_support_grouped_kernel_{suffix}_fcpt"
@@ -628,8 +633,8 @@ def make_lidar_integrate_kernels(
             lidar_build_support_pixels_from_keys_kernel
         ),
         "lidar_integrate_voxels_kernel": lidar_integrate_voxels_kernel,
-        "lidar_integrate_block_rgb_from_support_kernel": (
-            lidar_integrate_block_rgb_from_support_kernel
+        "lidar_integrate_block_grid_rgb_from_support_kernel": (
+            lidar_integrate_block_grid_rgb_from_support_kernel
         ),
         "lidar_integrate_features_from_support_grouped_kernel": (
             lidar_integrate_features_from_support_grouped_kernel

@@ -47,6 +47,7 @@ spatial_hash = _kernels.spatial_hash
 hash_lookup = _kernels.hash_lookup
 find_or_insert_block = _kernels.find_or_insert_block
 clear_new_blocks_kernel = _kernels.clear_new_blocks_kernel
+clear_new_block_grid_rgb_kernel = _kernels.clear_new_block_grid_rgb_kernel
 linear_to_local_coords = _kernels.linear_to_local_coords
 local_to_linear_index = _kernels.local_to_linear_index
 world_to_block_coords = _coord_kernels.world_to_block_coords
@@ -803,9 +804,9 @@ class TestClearNewBlocks:
         # block_data is (max_blocks, 512, 2) - 3D layout
         tsdf.data.block_data[0, :, :].fill_(1.0)  # Block 0
         tsdf.data.block_data[5, :, :].fill_(2.0)  # Block 5
-        # block_rgb is (max_blocks, 4) - per-block weighted sums [R×w, G×w, B×w, W]
-        tsdf.data.block_rgb[0, :].fill_(100.0)
-        tsdf.data.block_rgb[5, :].fill_(128.0)
+        # block_grid_rgb is (max_blocks, color_grid_size**3, 4) RGBW sums.
+        tsdf.data.block_grid_rgb[0, :, :].fill_(100.0)
+        tsdf.data.block_grid_rgb[5, :, :].fill_(128.0)
 
         # Run clear kernel
         wp.launch(
@@ -813,7 +814,16 @@ class TestClearNewBlocks:
             dim=(config.max_blocks, config.block_size**3),
             inputs=[
                 wp.from_torch(tsdf.data.block_data, dtype=wp.float16),
-                wp.from_torch(tsdf.data.block_rgb, dtype=wp.float16),
+                wp.from_torch(tsdf.data.new_blocks, dtype=wp.int32),
+                wp.from_torch(tsdf.data.new_block_count, dtype=wp.int32),
+                config.max_blocks,
+            ],
+        )
+        wp.launch(
+            clear_new_block_grid_rgb_kernel,
+            dim=(config.max_blocks, config.color_grid_size**3 * 4),
+            inputs=[
+                wp.from_torch(tsdf.data.block_grid_rgb, dtype=wp.float16),
                 wp.from_torch(tsdf.data.new_blocks, dtype=wp.int32),
                 wp.from_torch(tsdf.data.new_block_count, dtype=wp.int32),
                 config.max_blocks,
@@ -822,11 +832,11 @@ class TestClearNewBlocks:
 
         # Block 0 should be cleared
         assert (tsdf.data.block_data[0, :, :] == 0).all()
-        assert (tsdf.data.block_rgb[0, :] == 0).all()
+        assert (tsdf.data.block_grid_rgb[0, :, :] == 0).all()
 
         # Block 5 should be cleared
         assert (tsdf.data.block_data[5, :, :] == 0).all()
-        assert (tsdf.data.block_rgb[5, :] == 0).all()
+        assert (tsdf.data.block_grid_rgb[5, :, :] == 0).all()
 
 
 if __name__ == "__main__":

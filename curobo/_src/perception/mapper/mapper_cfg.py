@@ -191,7 +191,7 @@ class MapperCfg:
     #: integration.
     profile_integration_kernel_timings: bool = False
     #: Upper bound on per-block accumulator weight. Caps fp16
-    #: ``block_rgb`` / ``block_features`` magnitudes each frame and sets
+    #: ``block_grid_rgb`` / ``block_features`` magnitudes each frame and sets
     #: the EMA decay rate for old observations (effective window
     #: ``~W_max / mean_per_frame_weight``). Raise for longer memory,
     #: lower for faster adaptation to dynamic scenes.
