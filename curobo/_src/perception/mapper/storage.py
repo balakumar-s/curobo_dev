@@ -13,7 +13,8 @@ Memory Layout:
     Block size: ``block_size**3`` voxels per block (default 8**3 = 512)
     Per voxel: 2 × float16 (sdf_weight, weight)
     Per block: color_grid_size**3 × 4 × float16 RGBW +
-        feature_dim × float16 features + 1 × float16 feature_weight
+        feature_block_grid_size**3 × feature_dim × float16 features +
+        feature_block_grid_size**3 × float16 feature_weight
 
 Memory Budget example (block_size=8, 100K blocks):
     - hash_table:         1.6 MB (200K × 8 bytes, packed key+value)
@@ -31,7 +32,7 @@ All per-block weighted-sum accumulators (``block_grid_rgb``,
 ``block_features``, ``block_feature_weight``) are stored as fp16. The
 integration kernels pre-normalize RGB inputs by 255 and feature inputs
 to unit magnitude so per-pixel atomic-add increments stay ``O(1)``.
-A post-frame rescale kernel caps each per-node/block weight at
+A post-frame rescale kernel caps each per-node weight at
 :attr:`BlockSparseTSDFCfg.accumulator_w_max` and scales the weighted-sum
 channels proportionally, preserving the weighted mean while keeping
 magnitudes inside fp16's finite range.
@@ -57,10 +58,11 @@ from curobo._src.perception.mapper.constants import (
     PY_HASH_EMPTY,
     PY_HASH_TOMBSTONE,
     PY_VALUE_MASK,
+    _validate_block_size,
     _validate_color_grid_size,
+    _validate_feature_block_grid_size,
     _validate_feature_channels_per_thread,
     _validate_feature_grid_shape,
-    _validate_block_size,
     validate_grid_shape_for_hash_layout,
 )
 from curobo._src.perception.mapper.kernel.builder.builder_block_sparse_kernel import (
@@ -117,6 +119,9 @@ class BlockSparseTSDFCfg:
     #: Per-block feature channel dimensionality. 0 disables the channel
     #: (dummy tensors are allocated for Warp compatibility).
     feature_dim: int = 0
+    #: Number of feature control points per block edge. This is independent
+    #: from the incoming 2D feature image dimensions.
+    feature_block_grid_size: int = 1
     #: Compile-time feature-grid height used when this storage builds its
     #: own kernel bundle. Required when ``feature_dim > 0``; must be
     #: ``None`` when features are disabled.
@@ -138,7 +143,7 @@ class BlockSparseTSDFCfg:
     #: kernel specialization value; changing it requires rebuilding storage and
     #: kernels. Total storage is ``color_grid_size ** 3`` RGBW accumulators per block.
     color_grid_size: int = 1
-    #: Upper bound on per-node RGB grid weight and per-block feature weight
+    #: Upper bound on per-node RGB and feature-grid weights
     #: after each integration step. Caps the magnitude of fp16 weighted-sum
     #: accumulators so they stay inside fp16's finite range and bounds
     #: ulp-loss on subsequent atomic adds.
@@ -178,6 +183,10 @@ class BlockSparseTSDFCfg:
                 f"{self.max_support_pixels_per_block_camera}."
             )
         _validate_color_grid_size(self.color_grid_size, self.block_size)
+        _validate_feature_block_grid_size(
+            self.feature_block_grid_size,
+            self.block_size,
+        )
         if self.max_blocks > DEFAULT_HASH_LAYOUT.max_pool_idx:
             raise ValueError(
                 f"max_blocks={self.max_blocks:,} exceeds the "
@@ -207,7 +216,7 @@ class BlockDataView:
     voxel centers returned by :func:`extract_occupied_voxels`.
 
     When the feature channel is disabled (``feature_dim == 0``),
-    ``features`` / ``feature_weight`` are dummy ``(1, 1)`` / ``(1,)``
+    ``features`` / ``feature_weight`` are dummy ``(1, 1, 1)`` / ``(1, 1)``
     tensors kept only for Warp compatibility.
     """
 
@@ -219,8 +228,9 @@ class BlockDataView:
     block_size: int
     grid_shape: Tuple[int, int, int]
     color_grid_size: int
-    features: torch.Tensor  # (max_blocks, feature_dim) fp16 weighted sums, or (1, 1) dummy
-    feature_weight: torch.Tensor  # (max_blocks,) fp16 weight sums, or (1,) dummy
+    feature_block_grid_size: int
+    features: torch.Tensor  # (max_blocks, feature_block_grid_size**3, feature_dim) fp16 or dummy
+    feature_weight: torch.Tensor  # (max_blocks, feature_block_grid_size**3) fp16 or dummy
     feature_dim: int  # 0 when the feature channel is disabled
 
     def sample_rgbw_at_centers(
@@ -267,10 +277,78 @@ class BlockDataView:
         )
         return self.rgb_grid[pool_idx, node_idx].float()
 
+    def _feature_node_indices_at_centers(
+        self,
+        centers: torch.Tensor,
+        block_idx_per_voxel: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return nearest local feature-node indices for voxel centers."""
+        pool_idx = block_idx_per_voxel.long()
+        if self.feature_block_grid_size <= 1 or self.block_size <= 1:
+            return torch.zeros_like(pool_idx, dtype=torch.long)
+
+        coords = self.coords.view(-1, 3)[pool_idx].long()
+        grid_d, grid_h, grid_w = (int(v) for v in self.grid_shape)
+        blocks_x = (grid_w + self.block_size - 1) // self.block_size
+        blocks_y = (grid_h + self.block_size - 1) // self.block_size
+        blocks_z = (grid_d + self.block_size - 1) // self.block_size
+        offsets = torch.tensor(
+            [blocks_x // 2, blocks_y // 2, blocks_z // 2],
+            dtype=coords.dtype,
+            device=coords.device,
+        )
+        block_base = (coords + offsets).to(dtype=centers.dtype) * float(self.block_size)
+        center_offset = torch.tensor(
+            [grid_w, grid_h, grid_d],
+            dtype=centers.dtype,
+            device=centers.device,
+        ) * 0.5
+        voxel_f = centers - self.origin.to(device=centers.device, dtype=centers.dtype)
+        voxel_f = voxel_f / float(self.voxel_size) + center_offset
+        local = voxel_f - block_base.to(device=centers.device)
+
+        grid_max = float(self.feature_block_grid_size - 1)
+        scale = grid_max / float(self.block_size - 1)
+        grid_f = ((local - 0.5) * scale).clamp(min=0.0, max=grid_max)
+        grid_idx = torch.floor(grid_f + 0.5).to(dtype=torch.long)
+        return (
+            grid_idx[:, 2]
+            * self.feature_block_grid_size
+            * self.feature_block_grid_size
+            + grid_idx[:, 1] * self.feature_block_grid_size
+            + grid_idx[:, 0]
+        )
+
+    def sample_features_at_centers(
+        self,
+        centers: torch.Tensor,
+        block_idx_per_voxel: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Gather nearest-node normalized features for voxel centers."""
+        if self.feature_dim == 0:
+            raise RuntimeError(
+                "sample_features_at_centers() called with feature_dim == 0. "
+                "Enable features via BlockSparseTSDFCfg.feature_dim."
+            )
+        if centers.numel() == 0:
+            return self.features.new_empty((0, self.feature_dim), dtype=torch.float32)
+
+        pool_idx = block_idx_per_voxel.long()
+        node_idx = self._feature_node_indices_at_centers(
+            centers,
+            block_idx_per_voxel,
+        )
+        gathered = self.features[pool_idx, node_idx].float()
+        weight = self.feature_weight[pool_idx, node_idx].float()
+        return gathered / weight.clamp(min=eps).unsqueeze(-1)
+
     def features_normalized(self, eps: float = 1e-6) -> torch.Tensor:
         """Return active-block features normalized by per-block weight.
 
-        Shape: ``(num_allocated, feature_dim)`` float32. Accumulators
+        Shape: ``(num_allocated, feature_dim)`` float32. The per-block
+        descriptor is the weighted mean across that block's feature grid.
+        Accumulators
         are stored fp16; the divide is done in fp32 to avoid compounding
         ulp loss on top of the post-frame rescale. Raises if the feature
         channel is disabled so callers fail loudly rather than silently
@@ -283,8 +361,9 @@ class BlockDataView:
                 "BlockSparseTSDFCfg.feature_dim (or MapperCfg.feature_dim)."
             )
         n = self.num_allocated
-        weight = self.feature_weight[:n].float().clamp(min=eps).unsqueeze(-1)
-        return self.features[:n].float() / weight
+        summed_features = self.features[:n].float().sum(dim=1)
+        summed_weight = self.feature_weight[:n].float().sum(dim=1).clamp(min=eps)
+        return summed_features / summed_weight.unsqueeze(-1)
 
 
 @dataclass
@@ -292,40 +371,65 @@ class OccupiedVoxels:
     """Result of :func:`extract_occupied_voxels`.
 
     Attributes:
-        centers: ``(N, 3)`` float32 voxel world positions.
+        centers: ``(N, 3)`` float32 voxel or subvoxel sample world positions.
         block_idx_per_voxel: ``(N,)`` int32 global ``pool_idx`` — index into
             :class:`BlockDataView` fields.
         block_data: Reference view of per-block storage tensors.
+        texture_colors: Optional ``(N, 3)`` uint8 RGB samples from visibility-tested
+            texture observations.
+        texture_valid: Optional ``(N,)`` bool mask. True entries use
+            :attr:`texture_colors` when callers prefer texture output.
+        subvoxel_factor: Number of point samples per source voxel axis.
     """
 
     centers: torch.Tensor
     block_idx_per_voxel: torch.Tensor
     block_data: BlockDataView
+    texture_colors: Optional[torch.Tensor] = None
+    texture_valid: Optional[torch.Tensor] = None
+    subvoxel_factor: int = 1
 
     def __len__(self) -> int:
         return self.centers.shape[0]
 
-    def colors_uint8(self, eps: float = 1e-6) -> torch.Tensor:
+    def colors_uint8(self, eps: float = 1e-6, prefer_texture: bool = True) -> torch.Tensor:
         """Gather per-voxel RGB colors as ``(N, 3)`` uint8.
 
         Weighted sums (stored fp16, RGB normalized to ``[0, 1]`` at the
         integration site) are divided in fp32 and rescaled back to
         ``[0, 255]`` before the uint8 cast. Clamp protects degenerate
-        blocks with zero weight from division by zero.
+        blocks with zero weight from division by zero. When texture colors
+        are present and ``prefer_texture`` is true, valid texture samples
+        replace the persistent TSDF color-grid color.
         """
         rgb = self.block_data.sample_rgbw_at_centers(
             self.centers,
             self.block_idx_per_voxel,
         )
+        observed = rgb[:, 3] > eps
         normalized = rgb[:, :3] / rgb[:, 3:4].clamp(min=eps)
-        return (normalized * 255.0).clamp(0.0, 255.0).to(torch.uint8)
+        colors = (normalized * 255.0).clamp(0.0, 255.0).to(torch.uint8)
+        if (~observed).any():
+            colors = colors.clone()
+            colors[~observed] = 128
+        if (
+            prefer_texture
+            and self.texture_colors is not None
+            and self.texture_valid is not None
+            and self.texture_colors.numel() > 0
+        ):
+            valid = self.texture_valid.bool()
+            if valid.any():
+                colors = colors.clone()
+                colors[valid] = self.texture_colors[valid]
+        return colors
 
     def features(self, eps: float = 1e-6) -> torch.Tensor:
         """Gather per-voxel normalized features as ``(N, feature_dim)`` float32.
 
         Weighted sums (stored fp16) are divided in fp32 to avoid
-        compounding ulp loss. The per-block feature weight is clamped to
-        avoid division by zero for blocks that never received a feature
+        compounding ulp loss. The per-node feature weight is clamped to
+        avoid division by zero for nodes that never received a feature
         observation.
         """
         if self.block_data.feature_dim == 0:
@@ -333,9 +437,11 @@ class OccupiedVoxels:
                 "OccupiedVoxels.features() called with feature_dim == 0. "
                 "Enable features via BlockSparseTSDFCfg.feature_dim."
             )
-        gathered = self.block_data.features[self.block_idx_per_voxel].float()
-        weight = self.block_data.feature_weight[self.block_idx_per_voxel].float()
-        return gathered / weight.clamp(min=eps).unsqueeze(-1)
+        return self.block_data.sample_features_at_centers(
+            self.centers,
+            self.block_idx_per_voxel,
+            eps=eps,
+        )
 
 
 @dataclass
@@ -420,9 +526,9 @@ class BlockSparseTSDFData:
     block_data: torch.Tensor  # (max_blocks, block_size**3, 2) float16 or (1, 1, 2) dummy
     block_grid_rgb: torch.Tensor  # (max_blocks, color_grid_size**3, 4) fp16 RGBW sums
 
-    # Per-block feature channel (weighted-sum accumulator + dedicated weight)
-    block_features: torch.Tensor  # (max_blocks, feature_dim) float16 or (1, 1) dummy
-    block_feature_weight: torch.Tensor  # (max_blocks,) float16 or (1,) dummy
+    # Per-block feature grid (weighted-sum accumulator + dedicated weight)
+    block_features: torch.Tensor  # (max_blocks, feature_block_grid_size**3, feature_dim) or dummy
+    block_feature_weight: torch.Tensor  # (max_blocks, feature_block_grid_size**3) or dummy
 
     # Static SDF channel (separate tensor for primitives)
     static_block_data: torch.Tensor  # (max_blocks, block_size**3) float16 or (1, 1) dummy
@@ -467,6 +573,7 @@ class BlockSparseTSDFData:
     has_features: bool = False
     feature_dim: int = 0
     color_grid_size: int = 1
+    feature_block_grid_size: int = 1
 
     def to_warp(self) -> BlockSparseTSDFWarp:
         """Convert to Warp struct for kernel launches.
@@ -486,7 +593,7 @@ class BlockSparseTSDFData:
         s.block_data = wp.from_torch(self.block_data, dtype=wp.float16)
         s.block_grid_rgb = wp.from_torch(self.block_grid_rgb, dtype=wp.float16)
 
-        # Per-block feature channel (fp16 weighted sums, post-frame cap bounds magnitude)
+        # Per-block feature grid (fp16 weighted sums, post-frame cap bounds magnitude)
         s.block_features = wp.from_torch(self.block_features, dtype=wp.float16)
         s.block_feature_weight = wp.from_torch(self.block_feature_weight, dtype=wp.float16)
 
@@ -499,6 +606,7 @@ class BlockSparseTSDFData:
         s.has_features = self.has_features
         s.feature_dim = self.feature_dim
         s.color_grid_size = self.color_grid_size
+        s.feature_block_grid_size = self.feature_block_grid_size
 
         # Block metadata
         s.block_coords = wp.from_torch(self.block_coords, dtype=wp.int32)
@@ -666,6 +774,12 @@ class BlockSparseTSDF:
             f"kernels.color_grid_size={kernels.color_grid_size} does not match "
             f"config.color_grid_size={config.color_grid_size}"
         )
+        assert kernels.feature_block_grid_size == config.feature_block_grid_size, (
+            "kernels.feature_block_grid_size="
+            f"{kernels.feature_block_grid_size} does not match "
+            "config.feature_block_grid_size="
+            f"{config.feature_block_grid_size}"
+        )
         assert kernels.hash_layout == DEFAULT_HASH_LAYOUT, (
             f"kernels.hash_layout={kernels.hash_layout} does not match "
             f"DEFAULT_HASH_LAYOUT={DEFAULT_HASH_LAYOUT}"
@@ -706,33 +820,35 @@ class BlockSparseTSDF:
                 device=self.device,
             )
 
-        # Conditional allocation for per-block feature channel
+        color_grid_voxels = config.color_grid_size**3
+        feature_grid_voxels = config.feature_block_grid_size**3
+
+        # Conditional allocation for per-block feature grid
         has_features = config.feature_dim > 0
         if has_features:
             block_features = torch.zeros(
-                (config.max_blocks, config.feature_dim),
+                (config.max_blocks, feature_grid_voxels, config.feature_dim),
                 dtype=torch.float16,
                 device=self.device,
             )
             block_feature_weight = torch.zeros(
-                config.max_blocks,
+                (config.max_blocks, feature_grid_voxels),
                 dtype=torch.float16,
                 device=self.device,
             )
         else:
             # Dummy tensors for Warp compatibility when disabled
             block_features = torch.zeros(
-                (1, 1),
+                (1, 1, 1),
                 dtype=torch.float16,
                 device=self.device,
             )
             block_feature_weight = torch.zeros(
-                1,
+                (1, 1),
                 dtype=torch.float16,
                 device=self.device,
             )
 
-        color_grid_voxels = config.color_grid_size**3
         block_grid_rgb = torch.zeros(
             (config.max_blocks, color_grid_voxels, 4),
             dtype=torch.float16,
@@ -754,8 +870,8 @@ class BlockSparseTSDF:
             # to [0, 1] at integration/stamping sites; divide by channel 3
             # and multiply by 255 at read time for uint8 colors.
             block_grid_rgb=block_grid_rgb,
-            # Per-block feature channel (conditional). feature_dim==0 gives
-            # (1, 1) / (1,) dummies so the Warp struct can always be built.
+            # Per-block feature grid (conditional). feature_dim==0 gives
+            # small dummies so the Warp struct can always be built.
             block_features=block_features,
             block_feature_weight=block_feature_weight,
             # Block pool - static channel (conditional)
@@ -827,6 +943,7 @@ class BlockSparseTSDF:
             has_features=has_features,
             feature_dim=config.feature_dim,
             color_grid_size=config.color_grid_size,
+            feature_block_grid_size=config.feature_block_grid_size,
         )
 
         # Cached Warp struct (for CUDA graph compatibility)
@@ -910,8 +1027,8 @@ class BlockSparseTSDF:
         if self._data.has_static:
             self._data.static_block_data.fill_(float("inf"))
 
-        # Note: block_data and block_grid_rgb are cleared lazily when blocks
-        # are allocated.
+        # Note: block_data, block_grid_rgb, and feature grids are cleared
+        # lazily when blocks are allocated.
 
     def export_blocks(self) -> Dict[str, torch.Tensor]:
         """Export active block payload tensors in compact pool order.

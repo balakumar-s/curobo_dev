@@ -30,8 +30,8 @@ namespace curobo{
         // inputs for update best operation
         ScalarType *best_cost, // batchsize x 1
         ScalarType *best_action, // batchsize x opt_dim
-        int16_t *best_iteration, // batchsize x 1
-        int16_t *current_iteration, // batchsize x 1
+        int32_t *best_iteration, // batchsize x 1
+        int32_t *current_iteration, // batchsize x 1
         uint8_t *converged_global, // batchsize x 1
         const int convergence_iteration, // 1
         const float cost_delta_threshold, // 1

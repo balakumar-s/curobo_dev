@@ -5,7 +5,9 @@
 """Tests for geometry types module."""
 
 # Standard Library
+import json
 import os
+import struct
 import tempfile
 
 # Third Party
@@ -263,6 +265,43 @@ class TestMesh:
         mesh = Mesh(name="tri", pose=[5, 5, 5, 1, 0, 0, 0], vertices=vertices, faces=faces)
         trimesh_obj = mesh.get_trimesh_mesh(transform_with_pose=True)
         assert trimesh_obj is not None
+
+    def test_mesh_textured_glb_export_from_numpy_image(self, tmp_path):
+        """Test textured GLB export from a numpy texture image."""
+        vertices = [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]]
+        faces = [[0, 1, 2], [0, 2, 3]]
+        texture_uvs = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            dtype=np.float32,
+        )
+        texture_image = np.zeros((2, 2, 3), dtype=np.uint8)
+        texture_image[0, 0] = [255, 0, 0]
+        texture_image[0, 1] = [0, 255, 0]
+        texture_image[1, 0] = [0, 0, 255]
+        texture_image[1, 1] = [255, 255, 255]
+        mesh = Mesh(
+            name="textured",
+            pose=[0, 0, 0, 1, 0, 0, 0],
+            vertices=vertices,
+            faces=faces,
+            texture_uvs=texture_uvs,
+            texture_image=texture_image,
+        )
+
+        trimesh_obj = mesh.get_trimesh_mesh(process=False)
+        assert type(trimesh_obj.visual).__name__ == "TextureVisuals"
+        texture = trimesh_obj.visual.material.image
+        assert type(texture).__name__ == "_ArrayTextureImage"
+        assert np.asarray(texture.convert("RGBA")).shape == (2, 2, 4)
+
+        mesh_path = tmp_path / "textured_mesh.glb"
+        mesh.save_as_mesh(str(mesh_path))
+        glb = mesh_path.read_bytes()
+        json_len, _json_type = struct.unpack_from("<II", glb, 12)
+        gltf = json.loads(glb[20 : 20 + json_len].decode("utf-8"))
+        primitive_attrs = gltf["meshes"][0]["primitives"][0]["attributes"]
+        assert "TEXCOORD_0" in primitive_attrs
+        assert gltf.get("images") and "bufferView" in gltf["images"][0]
 
     def test_mesh_get_mesh_data(self):
         """Test getting mesh data."""

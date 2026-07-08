@@ -42,10 +42,10 @@ class BestTracker:
             dtype=self.device_cfg.dtype,
         )
         self.iteration = torch.zeros(
-            (num_problems,), device=self.device_cfg.device, dtype=torch.int16
+            (num_problems,), device=self.device_cfg.device, dtype=torch.int32
         )
         self.current_iteration = torch.zeros(
-            (num_problems,), device=self.device_cfg.device, dtype=torch.int16
+            (num_problems,), device=self.device_cfg.device, dtype=torch.int32
         )
         self.previous_step_direction = torch.zeros(
             (num_problems, action_horizon, action_dim),

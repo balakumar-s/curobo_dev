@@ -64,9 +64,11 @@ class BlockSparseTSDFWarp:
     block_data: wp.array3d(dtype=wp.float16)  # (max_blocks, BLOCK_SIZE**3, 2) or (1, 1, 2) dummy
     block_grid_rgb: wp.array3d(dtype=wp.float16)  # (max_blocks, color_grid_size**3, 4)
 
-    # Per-block feature channel (fp16 weighted sums + dedicated weight)
-    block_features: wp.array2d(dtype=wp.float16)  # (max_blocks, feature_dim) or (1, 1) dummy
-    block_feature_weight: wp.array(dtype=wp.float16)  # (max_blocks,) or (1,) dummy
+    # Per-block feature grid (fp16 weighted sums + dedicated weight)
+    # Shape: (max_blocks, feature_block_grid_size**3, feature_dim)
+    block_features: wp.array3d(dtype=wp.float16)
+    # Shape: (max_blocks, feature_block_grid_size**3)
+    block_feature_weight: wp.array2d(dtype=wp.float16)
 
     # Block pool - static channel (primitive SDF)
     static_block_data: wp.array2d(dtype=wp.float16)  # (max_blocks, BLOCK_SIZE**3) or (1, 1) dummy
@@ -77,6 +79,7 @@ class BlockSparseTSDFWarp:
     has_features: wp.bool  # True if per-block feature channel is enabled
     feature_dim: int  # 0 when the feature channel is disabled
     color_grid_size: int
+    feature_block_grid_size: int
 
     # Block metadata
     block_coords: wp.array(dtype=wp.int32)  # (max_blocks * 3,) signed block keys

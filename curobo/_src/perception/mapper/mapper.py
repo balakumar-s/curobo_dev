@@ -26,6 +26,7 @@ Example:
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from os import PathLike
 from typing import Callable, Optional, Tuple, Union
 
@@ -130,6 +131,9 @@ class Mapper:
             num_cameras=config.num_cameras,
             image_height=config.image_height,
             image_width=config.image_width,
+            texture_num_cameras=config.texture_num_cameras,
+            texture_camera_image_height=config.texture_camera_image_height,
+            texture_camera_image_width=config.texture_camera_image_width,
             lidar_num_sensors=config.lidar_num_sensors,
             lidar_image_height=config.lidar_image_height,
             lidar_image_width=config.lidar_image_width,
@@ -149,6 +153,7 @@ class Mapper:
             block_size=config.block_size,
             roughness=config.roughness,
             feature_dim=config.feature_dim,
+            feature_block_grid_size=config.feature_block_grid_size,
             feature_grid_height=config.feature_grid_height,
             feature_grid_width=config.feature_grid_width,
             max_visible_blocks_per_integration=config.max_visible_blocks_per_integration,
@@ -158,6 +163,7 @@ class Mapper:
             feature_integration_kernel=config.feature_integration_kernel,
             profile_integration_kernel_timings=config.profile_integration_kernel_timings,
             accumulator_w_max=config.accumulator_w_max,
+            color_grid_size=config.color_grid_size,
         )
 
         self._integrator = BlockSparseESDFIntegrator(integrator_config)
@@ -304,17 +310,14 @@ class Mapper:
 
     def extract_mesh(
         self,
-        refine_iterations: int = 2,
+        refine_iterations: int = 0,
         surface_only: bool = True,
-        approximate: bool = False,
     ) -> Mesh:
-        """Extract mesh using GPU marching cubes.
+        """Extract a triangle-soup mesh using GPU marching cubes.
 
         Args:
             refine_iterations: Newton-Raphson iterations for vertex refinement.
             surface_only: Only extract mesh near surface.
-            approximate: If True, use the approximate triangle-soup extractor
-                instead of the shared-vertex extractor.
 
         Returns:
             Mesh object with vertices, faces, and colors.
@@ -322,13 +325,44 @@ class Mapper:
         return self._integrator.extract_mesh(
             refine_iterations=refine_iterations,
             surface_only=surface_only,
-            approximate=approximate,
+        )
+
+    def extract_textured_mesh(
+        self,
+        texture_observations: CameraObservation | Sequence[CameraObservation],
+        refine_iterations: int = 0,
+        surface_only: bool = True,
+        camera_min_distance: Optional[float] = None,
+        camera_max_distance: Optional[float] = None,
+        texture_depth_tolerance_m: Optional[float] = None,
+    ) -> Mesh:
+        """Extract a TSDF mesh with visibility-tested RGB texture.
+
+        This works with TSDF geometry built from camera or LiDAR observations.
+        Texture observations require RGB images, intrinsics, and poses. Optional
+        depth images must be aligned float32 camera-frame z depth in meters; when
+        omitted, visibility depth is rendered from the current TSDF.
+        """
+        return self._integrator.extract_textured_mesh(
+            texture_observations=texture_observations,
+            refine_iterations=refine_iterations,
+            surface_only=surface_only,
+            camera_min_distance=camera_min_distance,
+            camera_max_distance=camera_max_distance,
+            texture_depth_tolerance_m=texture_depth_tolerance_m,
         )
 
     def extract_occupied_voxels(
         self,
-        surface_only: bool = False,
+        surface_only: bool = True,
         sdf_threshold: Optional[float] = None,
+        *,
+        subvoxel_factor: int = 1,
+        max_points: Optional[int] = None,
+        texture_observations: CameraObservation | Sequence[CameraObservation] | None = None,
+        camera_min_distance: Optional[float] = None,
+        camera_max_distance: Optional[float] = None,
+        texture_depth_tolerance_m: Optional[float] = None,
     ) -> OccupiedVoxels:
         """Extract occupied voxel centers and per-voxel block indices.
 
@@ -337,6 +371,15 @@ class Mapper:
                 surface. If False, include inside voxels too.
             sdf_threshold: Surface threshold. Defaults to the underlying
                 TSDF integrator's voxel size.
+            subvoxel_factor: Number of sample points per extracted voxel axis.
+            max_points: Optional cap applied after subvoxel expansion by
+                deterministically downsampling source voxels before expansion.
+            texture_observations: Optional RGB observations used to color output
+                samples when they pass visibility-depth checks.
+            camera_min_distance: Minimum camera-frame z used for texture projection.
+            camera_max_distance: Maximum camera-frame z used for texture projection.
+            texture_depth_tolerance_m: Absolute visibility-depth tolerance. If
+                None, each sample uses the mapper default tolerance policy.
 
         Returns:
             :class:`OccupiedVoxels` with voxel centers, per-voxel block
@@ -345,6 +388,12 @@ class Mapper:
         return self._integrator.extract_occupied_voxels(
             surface_only=surface_only,
             sdf_threshold=sdf_threshold,
+            subvoxel_factor=subvoxel_factor,
+            max_points=max_points,
+            texture_observations=texture_observations,
+            camera_min_distance=camera_min_distance,
+            camera_max_distance=camera_max_distance,
+            texture_depth_tolerance_m=texture_depth_tolerance_m,
         )
 
     def extract_matching_feature_voxels(
@@ -528,12 +577,15 @@ class Mapper:
         """Render depth and normals from current TSDF.
 
         Args:
-            intrinsics: Camera intrinsics (3, 3) or (4,) as [fx, fy, cx, cy].
-            pose: Camera-to-world transform as Pose.
+            intrinsics: Camera intrinsics ``(3, 3)``, ``(4,)``, ``(N, 3, 3)``,
+                or ``(N, 4)`` as ``[fx, fy, cx, cy]``.
+            pose: Camera-to-world transform as :class:`Pose` with matching camera count.
             image_shape: (height, width) of output images.
 
         Returns:
-            Tuple of (depth, normals, valid_mask).
+            Tuple of ``(depth, normals, valid_mask)``. Unbatched single-camera
+            inputs return ``(H, W)``, ``(H, W, 3)``, and ``(H, W)``; batched
+            inputs return ``(N, H, W)``, ``(N, H, W, 3)``, and ``(N, H, W)``.
         """
         return self._get_renderer().render(intrinsics, pose, image_shape)
 
@@ -546,16 +598,15 @@ class Mapper:
         """Render depth, normals, and color from current TSDF.
 
         Args:
-            intrinsics: Camera intrinsics (3, 3) or (4,) as [fx, fy, cx, cy].
-            pose: Camera-to-world transform as Pose.
+            intrinsics: Camera intrinsics ``(3, 3)``, ``(4,)``, ``(N, 3, 3)``,
+                or ``(N, 4)`` as ``[fx, fy, cx, cy]``.
+            pose: Camera-to-world transform as :class:`Pose` with matching camera count.
             image_shape: (height, width) of output images.
 
         Returns:
             Tuple of (depth, normals, color, valid_mask).
-            - depth: (H, W) in meters
-            - normals: (H, W, 3) world-frame normals
-            - color: (H, W, 3) uint8 RGB
-            - valid_mask: (H, W) bool
+            Unbatched single-camera inputs keep ``(H, W)`` and ``(H, W, 3)``
+            shapes; batched inputs include a leading camera dimension.
         """
         return self._get_renderer().render_color(intrinsics, pose, image_shape)
 
@@ -569,11 +620,11 @@ class Mapper:
 
         Args:
             intrinsics: Camera intrinsics.
-            pose: Camera-to-world transform as Pose.
+            pose: Camera-to-world transform as :class:`Pose`.
             image_shape: (height, width) of output images.
 
         Returns:
-            depth: (H, W) in meters.
+            depth: ``(H, W)`` or ``(N, H, W)`` in meters.
         """
         return self._get_renderer().render_depth(intrinsics, pose, image_shape)
 
@@ -591,7 +642,7 @@ class Mapper:
             image_shape: (height, width) of output images.
 
         Returns:
-            color: (H, W, 3) uint8 RGB.
+            color: ``(H, W, 3)`` or ``(N, H, W, 3)`` uint8 RGB.
         """
         return self._get_renderer().render_color_only(intrinsics, pose, image_shape)
 
@@ -615,7 +666,7 @@ class Mapper:
             use_color: If True, use TSDF color. If False, use gray.
 
         Returns:
-            shaded: (H, W, 3) uint8 RGB shaded image.
+            shaded: ``(H, W, 3)`` or ``(N, H, W, 3)`` uint8 RGB shaded image.
         """
         return self._get_renderer().render_shaded(
             intrinsics, pose, image_shape, light_direction, ambient, use_color
@@ -635,7 +686,7 @@ class Mapper:
             image_shape: (height, width) of output images.
 
         Returns:
-            colormap: (H, W, 3) uint8 RGB colormap.
+            colormap: ``(H, W, 3)`` or ``(N, H, W, 3)`` uint8 RGB colormap.
         """
         return self._get_renderer().render_depth_colormap(
             intrinsics, pose, image_shape
@@ -655,6 +706,6 @@ class Mapper:
             image_shape: (height, width) of output images.
 
         Returns:
-            colormap: (H, W, 3) uint8 RGB colormap.
+            colormap: ``(H, W, 3)`` or ``(N, H, W, 3)`` uint8 RGB colormap.
         """
         return self._get_renderer().render_normal_colormap(intrinsics, pose, image_shape)

@@ -11,6 +11,7 @@ import math
 import pytest
 import torch
 
+from curobo.examples.reference.lidar_volumetric_mapping import tsdf_surface_voxels_with_blocks
 from curobo._src.perception.mapper.integrator_tsdf import (
     BlockSparseTSDFIntegrator,
     BlockSparseTSDFIntegratorCfg,
@@ -18,6 +19,41 @@ from curobo._src.perception.mapper.integrator_tsdf import (
 from curobo._src.types.lidar import LidarObservation
 from curobo._src.types.pose import Pose
 from curobo._src.util.warp import init_warp
+
+
+class _FakeConfig:
+    block_size = 8
+    voxel_size = 0.05
+    grid_shape = (8, 8, 8)
+    grid_center = torch.zeros(3, dtype=torch.float32)
+    minimum_tsdf_weight = 0.0
+    color_grid_size = 4
+
+
+class _FakeTsdf:
+    def export_blocks(self) -> dict[str, torch.Tensor]:
+        block_data = torch.zeros((1, 512, 2), dtype=torch.float32)
+        block_data[..., 1] = 1.0
+        block_grid_rgb = torch.zeros((1, 64, 4), dtype=torch.float16)
+        for idx in range(64):
+            x = idx % 4
+            y = (idx // 4) % 4
+            z = idx // 16
+            block_grid_rgb[0, idx, :3] = torch.tensor(
+                [float(x) / 3.0, float(y) / 3.0, float(z) / 3.0],
+                dtype=torch.float16,
+            )
+            block_grid_rgb[0, idx, 3] = 1.0
+        return {
+            "active_block_coords": torch.zeros((1, 3), dtype=torch.int32),
+            "block_data": block_data,
+            "block_grid_rgb": block_grid_rgb,
+        }
+
+
+class _FakeMapper:
+    config = _FakeConfig()
+    tsdf = _FakeTsdf()
 
 
 def _as_angle_range(elevation_range_rad: tuple[float, float]) -> tuple[float, float]:
@@ -234,6 +270,19 @@ def test_lidar_planar_2d_rejects_non_fixed_elevation_range():
         )
 
 
+def test_lidar_example_surface_preview_samples_color_grid_nodes():
+    """The Viser preview should color voxels from their local RGB-grid node."""
+    centers, colors, block_idx, _ = tsdf_surface_voxels_with_blocks(_FakeMapper())
+
+    assert centers.shape == (512, 3)
+    assert colors.shape == (512, 3)
+    assert block_idx.shape == (512,)
+    assert len({tuple(color.tolist()) for color in colors}) > 1
+    assert tuple(colors[0].tolist()) == (0, 0, 0)
+    assert colors[6, 0] == 255
+    assert tuple(colors[-1].tolist()) == (255, 255, 255)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_lidar_integrator_allocates_blocks_from_planar_scan():
     """Smoke-test the end-to-end LiDAR integration path on CUDA."""
@@ -281,6 +330,14 @@ def test_lidar_integrator_allocates_blocks_from_planar_scan():
     assert stats["num_allocated"] > 0
     assert stats["last_lidar_integration"]["num_visible_blocks"] > 0
 
+    n_blocks = stats["num_allocated"]
+    rgbw = integrator.tsdf.data.block_grid_rgb[:n_blocks, 0].float()
+    active = rgbw[:, 3] > 0
+    assert active.any()
+    normalized = rgbw[active, :3] / rgbw[active, 3:4].clamp(min=1e-6)
+    assert normalized[:, 0].mean() > 0.95
+    assert normalized[:, 1:].max() < 0.05
+
     with pytest.raises(ValueError, match="fixed elevation"):
         _lidar_point_to_pixel(
             torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
@@ -288,3 +345,165 @@ def test_lidar_integrator_allocates_blocks_from_planar_scan():
             image_width=8,
             elevation_range_rad=(-0.1, 0.1),
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_lidar_color_grid_projects_individual_nodes():
+    """LiDAR RGB integration should not broadcast one block color to every grid node."""
+    init_warp()
+    device = "cuda:0"
+    image_height = 9
+    image_width = 64
+    cfg = BlockSparseTSDFIntegratorCfg(
+        voxel_size=0.05,
+        origin=torch.zeros(3, dtype=torch.float32),
+        truncation_distance=0.12,
+        grid_shape=(64, 64, 64),
+        max_blocks=4096,
+        block_size=4,
+        color_grid_size=4,
+        image_height=4,
+        image_width=4,
+        num_cameras=1,
+        lidar_num_sensors=1,
+        lidar_image_height=image_height,
+        lidar_image_width=image_width,
+        device=device,
+    )
+    integrator = BlockSparseTSDFIntegrator(cfg)
+
+    ranges = torch.full((1, image_height, image_width), 1.0, dtype=torch.float32, device=device)
+    azimuth_color = torch.linspace(0, 255, image_width, dtype=torch.float32, device=device).round()
+    elevation_color = torch.linspace(0, 255, image_height, dtype=torch.float32, device=device).round()
+    rgb = torch.zeros((1, image_height, image_width, 3), dtype=torch.uint8, device=device)
+    rgb[0, :, :, 0] = azimuth_color.to(dtype=torch.uint8).view(1, image_width)
+    rgb[0, :, :, 1] = (255.0 - azimuth_color).to(dtype=torch.uint8).view(1, image_width)
+    rgb[0, :, :, 2] = elevation_color.to(dtype=torch.uint8).view(image_height, 1)
+    observation = LidarObservation(
+        range_image=ranges,
+        rgb_image=rgb,
+        pose=Pose(
+            position=torch.zeros((1, 3), dtype=torch.float32, device=device),
+            quaternion=torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0]],
+                dtype=torch.float32,
+                device=device,
+            ),
+        ),
+        valid_range_m=torch.tensor([[0.1, 3.0]], dtype=torch.float32, device=device),
+        elevation_range_rad=torch.tensor([[-0.4, 0.4]], dtype=torch.float32, device=device),
+    )
+
+    integrator.integrate(lidar_observation=observation)
+    stats = integrator.get_stats(scan_pool=True)
+    n_blocks = stats["num_allocated"]
+    assert n_blocks > 0
+
+    rgbw = integrator.tsdf.data.block_grid_rgb[:n_blocks].float()
+    active = rgbw[..., 3] > 0
+    normalized = torch.zeros_like(rgbw[..., :3])
+    normalized[active] = rgbw[..., :3][active] / rgbw[..., 3:4][active].clamp(min=1e-6)
+
+    found_varying_block = False
+    for grid_rgb, block_active in zip(normalized.detach().cpu(), active.detach().cpu()):
+        if int(block_active.sum()) < 2:
+            continue
+        colors = grid_rgb[block_active]
+        variation = (colors.max(dim=0).values - colors.min(dim=0).values).abs().max()
+        if float(variation) > 0.05:
+            found_varying_block = True
+            break
+
+    assert found_varying_block
+
+
+@pytest.mark.parametrize("feature_kernel", ["grouped", "tiled"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_lidar_feature_grid_projects_individual_nodes(feature_kernel: str):
+    """LiDAR feature integration should not broadcast one block feature to every grid node."""
+    init_warp()
+    device = "cuda:0"
+    image_height = 9
+    image_width = 64
+    feature_dim = 3
+    cfg = BlockSparseTSDFIntegratorCfg(
+        voxel_size=0.05,
+        origin=torch.zeros(3, dtype=torch.float32),
+        truncation_distance=0.12,
+        grid_shape=(64, 64, 64),
+        max_blocks=4096,
+        block_size=4,
+        color_grid_size=2,
+        feature_block_grid_size=4,
+        image_height=4,
+        image_width=4,
+        num_cameras=1,
+        lidar_num_sensors=1,
+        lidar_image_height=image_height,
+        lidar_image_width=image_width,
+        feature_dim=feature_dim,
+        feature_grid_height=1,
+        feature_grid_width=1,
+        lidar_feature_grid_height=image_height,
+        lidar_feature_grid_width=image_width,
+        feature_integration_kernel=feature_kernel,
+        device=device,
+    )
+    integrator = BlockSparseTSDFIntegrator(cfg)
+
+    ranges = torch.full((1, image_height, image_width), 1.0, dtype=torch.float32, device=device)
+    rgb = torch.zeros((1, image_height, image_width, 3), dtype=torch.uint8, device=device)
+    azimuth_feature = torch.linspace(0.0, 1.0, image_width, dtype=torch.float32, device=device)
+    elevation_feature = torch.linspace(0.0, 1.0, image_height, dtype=torch.float32, device=device)
+    feature_grid = torch.zeros(
+        (1, image_height, image_width, feature_dim),
+        dtype=torch.float16,
+        device=device,
+    )
+    feature_grid[0, :, :, 0] = azimuth_feature.view(1, image_width)
+    feature_grid[0, :, :, 1] = elevation_feature.view(image_height, 1)
+    feature_grid[0, :, :, 2] = (
+        0.5
+        * (
+            azimuth_feature.view(1, image_width)
+            + elevation_feature.view(image_height, 1)
+        )
+    )
+    observation = LidarObservation(
+        range_image=ranges,
+        rgb_image=rgb,
+        feature_grid=feature_grid.contiguous(),
+        pose=Pose(
+            position=torch.zeros((1, 3), dtype=torch.float32, device=device),
+            quaternion=torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0]],
+                dtype=torch.float32,
+                device=device,
+            ),
+        ),
+        valid_range_m=torch.tensor([[0.1, 3.0]], dtype=torch.float32, device=device),
+        elevation_range_rad=torch.tensor([[-0.4, 0.4]], dtype=torch.float32, device=device),
+    )
+
+    integrator.integrate(lidar_observation=observation)
+    stats = integrator.get_stats(scan_pool=True)
+    n_blocks = stats["num_allocated"]
+    assert n_blocks > 0
+
+    features = integrator.tsdf.data.block_features[:n_blocks].float()
+    weights = integrator.tsdf.data.block_feature_weight[:n_blocks].float()
+    active = weights > 0
+    normalized = torch.zeros_like(features)
+    normalized[active] = features[active] / weights[active].unsqueeze(-1)
+
+    found_varying_block = False
+    for block_features, block_active in zip(normalized.detach().cpu(), active.detach().cpu()):
+        if int(block_active.sum()) < 2:
+            continue
+        values = block_features[block_active]
+        variation = (values.max(dim=0).values - values.min(dim=0).values).abs().max()
+        if float(variation) > 0.05:
+            found_varying_block = True
+            break
+
+    assert found_varying_block

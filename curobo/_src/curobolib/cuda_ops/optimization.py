@@ -8,7 +8,6 @@ from torch.autograd import Function
 from curobo._src.curobolib.backends import optimization as optimization_cu
 from curobo._src.curobolib.cuda_ops.tensor_checks import (
     check_float32_tensors,
-    check_int16_tensors,
     check_int32_tensors,
     check_uint8_tensors,
 )
@@ -72,14 +71,11 @@ def wolfe_line_search(
         step_direction=step_direction,
         line_search_scale=line_search_context.line_search_scale,
     )
-    check_int16_tensors(
-        device,
-        best_iteration=iteration_state.best_iteration,
-        current_iteration=iteration_state.current_iteration,
-    )
     check_uint8_tensors(device, converged=iteration_state.converged)
     check_int32_tensors(
         device,
+        best_iteration=iteration_state.best_iteration,
+        current_iteration=iteration_state.current_iteration,
         exploration_idx=exploration_idx,
         selected_idx=selected_idx,
     )

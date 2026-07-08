@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 # Standard Library
+import struct
+import zlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -24,6 +26,109 @@ from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.pose import Pose
 from curobo._src.util.logging import log_and_raise, log_warn
 from curobo._src.util_file import get_assets_path, join_path
+
+
+class _ArrayTextureImage:
+    """Minimal image wrapper for trimesh texture export."""
+
+    format: Optional[str] = None
+
+    def __init__(self, image: np.ndarray) -> None:
+        """Create a texture image wrapper from a uint8 image of shape ``[H, W, C]``."""
+        image = np.asarray(image, dtype=np.uint8)
+        if image.ndim == 2:
+            self._image = np.ascontiguousarray(image)
+            self.mode = "L"
+        elif image.ndim == 3 and image.shape[2] == 1:
+            self._image = np.ascontiguousarray(image[..., 0])
+            self.mode = "L"
+        elif image.ndim == 3 and image.shape[2] == 3:
+            self._image = np.ascontiguousarray(image)
+            self.mode = "RGB"
+        elif image.ndim == 3 and image.shape[2] == 4:
+            self._image = np.ascontiguousarray(image)
+            self.mode = "RGBA"
+        else:
+            log_and_raise(
+                "Texture image must have shape [H, W], [H, W, 1], [H, W, 3], "
+                + "or [H, W, 4]"
+            )
+
+        self.height = int(self._image.shape[0])
+        self.width = int(self._image.shape[1])
+        self.size = (self.width, self.height)
+
+    def __array__(
+        self, dtype: Optional[np.dtype] = None, copy: Optional[bool] = None
+    ) -> np.ndarray:
+        """Return the backing image as a numpy array."""
+        image = self._image
+        if dtype is not None:
+            image = image.astype(dtype, copy=False)
+        if copy:
+            image = image.copy()
+        return image
+
+    def tobytes(self) -> bytes:
+        """Return raw image bytes."""
+        return self._image.tobytes()
+
+    def convert(self, mode: str) -> "_ArrayTextureImage":
+        """Convert the image to an RGB or RGBA channel layout."""
+        if mode == self.mode:
+            return _ArrayTextureImage(self._image)
+        if mode == "RGB":
+            if self.mode == "L":
+                return _ArrayTextureImage(np.repeat(self._image[..., None], 3, axis=2))
+            if self.mode == "RGBA":
+                return _ArrayTextureImage(self._image[..., :3])
+        if mode == "RGBA":
+            if self.mode == "L":
+                rgb_image = np.repeat(self._image[..., None], 3, axis=2)
+                alpha = np.full(self._image.shape + (1,), 255, dtype=np.uint8)
+                return _ArrayTextureImage(np.concatenate((rgb_image, alpha), axis=2))
+            if self.mode == "RGB":
+                alpha = np.full(self._image.shape[:2] + (1,), 255, dtype=np.uint8)
+                return _ArrayTextureImage(np.concatenate((self._image, alpha), axis=2))
+        log_and_raise("Texture image conversion to " + mode + " is not supported")
+
+    def save(self, fp: Any, format: Optional[str] = None) -> None:
+        """Save the image as PNG bytes to a path or writable file object."""
+        if format is not None and format.lower() != "png":
+            log_and_raise("Only PNG texture export is supported for array-backed textures")
+        data = self._to_png()
+        if hasattr(fp, "write"):
+            fp.write(data)
+            return
+        with open(fp, "wb") as image_file:
+            image_file.write(data)
+
+    def _to_png(self) -> bytes:
+        """Encode the backing image as a PNG byte stream."""
+        if self.mode == "L":
+            color_type = 0
+        elif self.mode == "RGB":
+            color_type = 2
+        elif self.mode == "RGBA":
+            color_type = 6
+        else:
+            log_and_raise("Texture image mode " + self.mode + " cannot be encoded as PNG")
+
+        header = struct.pack(">IIBBBBB", self.width, self.height, 8, color_type, 0, 0, 0)
+        raw_rows = b"".join(b"\x00" + np.ascontiguousarray(row).tobytes() for row in self._image)
+        compressed = zlib.compress(raw_rows)
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + self._png_chunk(b"IHDR", header)
+            + self._png_chunk(b"IDAT", compressed)
+            + self._png_chunk(b"IEND", b"")
+        )
+
+    @staticmethod
+    def _png_chunk(name: bytes, data: bytes) -> bytes:
+        """Create a PNG chunk."""
+        checksum = zlib.crc32(name + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + name + data + struct.pack(">I", checksum)
 
 
 @dataclass
@@ -89,9 +194,14 @@ class Obstacle:
             file_path: Path to save mesh file.
             transform_with_pose: Transform obstacle with pose before saving.
         """
-        mesh_scene = self.get_trimesh_mesh(transform_with_pose=transform_with_pose)
-
-
+        has_texture = (
+            getattr(self, "texture_uvs", None) is not None
+            and getattr(self, "texture_image", None) is not None
+        )
+        mesh_scene = self.get_trimesh_mesh(
+            process=not has_texture,
+            transform_with_pose=transform_with_pose,
+        )
         mesh_scene.export(file_path)
 
     def get_cuboid(self) -> Cuboid:
@@ -473,6 +583,12 @@ class Mesh(Obstacle):
     #: Vertex normals of mesh.
     vertex_normals: Optional[List[List[float]]] = None
 
+    #: Per-vertex UV coordinates for textured visualization/export.
+    texture_uvs: Optional[Union[List[List[float]], np.ndarray, torch.Tensor]] = None
+
+    #: Texture image for ``texture_uvs``. Expected shape is ``(H, W, 3)``.
+    texture_image: Optional[Union[np.ndarray, torch.Tensor]] = None
+
     #: Face colors of mesh. Should be float in range of [0, 1].
     face_colors: Optional[List[List[float]]] = None
 
@@ -566,7 +682,22 @@ class Mesh(Obstacle):
                 vertex_colors=self.vertex_colors,
                 vertex_normals=self.vertex_normals,
                 face_colors=self.face_colors,
+                process=process,
             )
+            if self.texture_uvs is not None and self.texture_image is not None:
+                uv = self.texture_uvs
+                image = self.texture_image
+                if isinstance(uv, torch.Tensor):
+                    uv = uv.detach().cpu().numpy()
+                if isinstance(image, torch.Tensor):
+                    image = image.detach().cpu().numpy()
+                if isinstance(image, np.ndarray):
+                    image = _ArrayTextureImage(image)
+                material = trimesh.visual.material.SimpleMaterial(
+                    image=image,
+                    diffuse=[255, 255, 255, 255],
+                )
+                m.visual = trimesh.visual.texture.TextureVisuals(uv=uv, material=material)
         if transform_with_pose:
             m.apply_transform(self.get_transform_matrix())
 
@@ -584,6 +715,10 @@ class Mesh(Obstacle):
             self.face_colors = self.face_colors.cpu()
         if self.vertex_colors is not None:
             self.vertex_colors = self.vertex_colors.cpu()
+        if isinstance(self.texture_uvs, torch.Tensor):
+            self.texture_uvs = self.texture_uvs.cpu()
+        if isinstance(self.texture_image, torch.Tensor):
+            self.texture_image = self.texture_image.cpu()
         return self
 
     def to_gpu(self):

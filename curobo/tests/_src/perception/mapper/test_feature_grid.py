@@ -11,6 +11,7 @@ from curobo._src.perception.mapper.integrator_tsdf import (
     BlockSparseTSDFIntegrator,
     BlockSparseTSDFIntegratorCfg,
 )
+from curobo._src.perception.mapper.storage import BlockDataView
 from curobo._src.types.camera import CameraObservation
 from curobo._src.util.warp import init_warp
 from curobo.tests._src.perception.mapper.conftest import make_observation
@@ -31,6 +32,33 @@ def test_camera_observation_feature_grid_copy_clone_to_cpu():
     moved = obs.to(torch.device("cpu"))
     assert moved is obs
     assert obs.feature_grid.device.type == "cpu"
+
+
+def test_block_data_view_samples_independent_feature_grid():
+    features = torch.arange(8, dtype=torch.float16).view(1, 8, 1)
+    view = BlockDataView(
+        rgb_grid=torch.zeros((1, 1, 4), dtype=torch.float16),
+        coords=torch.zeros(3, dtype=torch.int32),
+        num_allocated=1,
+        origin=torch.zeros(3, dtype=torch.float32),
+        voxel_size=1.0,
+        block_size=2,
+        grid_shape=(2, 2, 2),
+        color_grid_size=1,
+        feature_block_grid_size=2,
+        features=features,
+        feature_weight=torch.ones((1, 8), dtype=torch.float16),
+        feature_dim=1,
+    )
+    centers = torch.tensor(
+        [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        dtype=torch.float32,
+    )
+    block_indices = torch.zeros(2, dtype=torch.int32)
+
+    sampled = view.sample_features_at_centers(centers, block_indices)
+
+    torch.testing.assert_close(sampled, torch.tensor([[0.0], [7.0]]))
 
 
 @pytest.fixture
@@ -70,6 +98,9 @@ def _make_integrator(
     feature_dim: int,
     feature_channels_per_thread: int = 4,
     feature_grid_shape: tuple[int, int] | None = None,
+    feature_block_grid_size: int = 1,
+    color_grid_size: int = 1,
+    feature_integration_kernel: str = "auto",
 ) -> BlockSparseTSDFIntegrator:
     feature_grid_kwargs = {}
     if feature_dim > 0:
@@ -90,7 +121,10 @@ def _make_integrator(
             image_height=16,
             image_width=16,
             feature_dim=feature_dim,
+            feature_block_grid_size=feature_block_grid_size,
+            color_grid_size=color_grid_size,
             feature_channels_per_thread=feature_channels_per_thread,
+            feature_integration_kernel=feature_integration_kernel,
             max_support_pixels_per_block_camera=8,
             **feature_grid_kwargs,
         )
@@ -212,3 +246,32 @@ def test_feature_grid_grouping_keeps_trailing_channels(cuda_device):
     normalized = features[active] / weights[active].unsqueeze(-1)
     expected = channel_values.expand_as(normalized)
     torch.testing.assert_close(normalized, expected, atol=0.05, rtol=0.05)
+
+
+@pytest.mark.parametrize("feature_kernel", ["grouped", "tiled"])
+def test_feature_block_grid_is_independent_from_color_grid(
+    cuda_device,
+    feature_kernel: str,
+):
+    integrator = _make_integrator(
+        cuda_device,
+        feature_dim=3,
+        feature_grid_shape=(4, 4),
+        feature_block_grid_size=2,
+        color_grid_size=1,
+        feature_integration_kernel=feature_kernel,
+    )
+    feature_grid = torch.ones(
+        (1, 4, 4, 3),
+        dtype=torch.float16,
+        device=cuda_device,
+    )
+    obs = _make_feature_observation(cuda_device, feature_grid)
+
+    integrator.integrate(obs)
+
+    n_allocated = int(integrator.tsdf.data.num_allocated.item())
+    assert integrator.tsdf.data.block_grid_rgb.shape[1] == 1
+    assert integrator.tsdf.data.block_features.shape[1] == 8
+    weights = integrator.tsdf.data.block_feature_weight[:n_allocated].float()
+    assert int((weights > 0).sum(dim=1).max().item()) > 1

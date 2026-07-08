@@ -35,6 +35,7 @@ def _build_block_data_view(tsdf, num_alloc: int) -> BlockDataView:
         block_size=tsdf.block_size,
         grid_shape=tsdf.config.grid_shape,
         color_grid_size=tsdf.data.color_grid_size,
+        feature_block_grid_size=tsdf.data.feature_block_grid_size,
         features=tsdf.data.block_features,
         feature_weight=tsdf.data.block_feature_weight,
         feature_dim=tsdf.data.feature_dim,

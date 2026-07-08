@@ -107,8 +107,10 @@ def _stamp_orthogonal_features(
     gt_features = torch.zeros((num_alloc, feature_dim), dtype=torch.float32, device=device)
     for i in range(num_alloc):
         gt_features[i, i % feature_dim] = 1.0
-    integrator._tsdf.data.block_features[:num_alloc] = gt_features.to(torch.float16)
-    integrator._tsdf.data.block_feature_weight[:num_alloc] = 1.0
+    integrator._tsdf.data.block_features[:num_alloc].zero_()
+    integrator._tsdf.data.block_feature_weight[:num_alloc].zero_()
+    integrator._tsdf.data.block_features[:num_alloc, 0] = gt_features.to(torch.float16)
+    integrator._tsdf.data.block_feature_weight[:num_alloc, 0] = 1.0
     return gt_features
 
 
@@ -270,8 +272,8 @@ class TestMatchedVoxelsEdgeCases:
         inactive_pool_idx = 0
         integrator._tsdf.data.block_to_hash_slot[inactive_pool_idx] = -1
         integrator._tsdf.data.block_features[inactive_pool_idx].zero_()
-        integrator._tsdf.data.block_features[inactive_pool_idx, 0] = 100.0
-        integrator._tsdf.data.block_feature_weight[inactive_pool_idx] = 1.0
+        integrator._tsdf.data.block_features[inactive_pool_idx, 0, 0] = 100.0
+        integrator._tsdf.data.block_feature_weight[inactive_pool_idx, 0] = 1.0
 
         query = torch.zeros(feature_dim, device=device)
         query[0] = 1.0

@@ -63,6 +63,7 @@ def make_metadata(
     has_static: bool = False,
     feature_dim: int = 0,
     color_grid_size: int = 1,
+    feature_block_grid_size: int = 1,
 ):
     return {
         "voxel_size": 0.01,
@@ -74,6 +75,7 @@ def make_metadata(
         "has_static": has_static,
         "feature_dim": feature_dim,
         "color_grid_size": color_grid_size,
+        "feature_block_grid_size": feature_block_grid_size,
     }
 
 
@@ -83,9 +85,11 @@ def make_dynamic_blocks(
     block_size: int = 2,
     feature_dim: int = 0,
     color_grid_size: int = 1,
+    feature_block_grid_size: int = 1,
 ):
     block_voxels = block_size**3
     color_grid_voxels = color_grid_size**3
+    feature_grid_voxels = feature_block_grid_size**3
     coords = torch.arange(n_blocks * 3, dtype=torch.int32).reshape(n_blocks, 3)
     block_data = torch.zeros((n_blocks, block_voxels, 2), dtype=torch.float16)
     block_data[..., 0] = 0.5
@@ -100,10 +104,13 @@ def make_dynamic_blocks(
     }
     if feature_dim > 0:
         blocks["block_features"] = torch.ones(
-            (n_blocks, feature_dim),
+            (n_blocks, feature_grid_voxels, feature_dim),
             dtype=torch.float16,
         )
-        blocks["block_feature_weight"] = torch.ones(n_blocks, dtype=torch.float16)
+        blocks["block_feature_weight"] = torch.ones(
+            (n_blocks, feature_grid_voxels),
+            dtype=torch.float16,
+        )
     return blocks
 
 
@@ -134,6 +141,27 @@ def test_validate_block_payload_rejects_wrong_block_data_dtype():
         validate_block_payload(blocks, metadata)
 
 
+def test_validate_block_payload_uses_independent_feature_grid_size():
+    metadata = make_metadata(
+        block_size=4,
+        feature_dim=3,
+        color_grid_size=4,
+        feature_block_grid_size=2,
+    )
+    blocks = make_dynamic_blocks(
+        block_size=4,
+        feature_dim=3,
+        color_grid_size=4,
+        feature_block_grid_size=2,
+    )
+
+    validate_block_payload(blocks, metadata)
+
+    assert blocks["block_grid_rgb"].shape == (2, 64, 4)
+    assert blocks["block_features"].shape == (2, 8, 3)
+    assert blocks["block_feature_weight"].shape == (2, 8)
+
+
 def test_validate_block_metadata_rejects_extra_fields():
     metadata = make_metadata()
     metadata["unexpected"] = True
@@ -161,8 +189,8 @@ def test_prepare_blocks_for_import_applies_constant_weight():
         [2.0, 4.0, 6.0, 2.0],
         dtype=torch.float16,
     )
-    blocks["block_features"][0] = torch.tensor([2.0, 6.0], dtype=torch.float16)
-    blocks["block_feature_weight"][0] = 2.0
+    blocks["block_features"][0, 0] = torch.tensor([2.0, 6.0], dtype=torch.float16)
+    blocks["block_feature_weight"][0, 0] = 2.0
 
     prepared = prepare_blocks_for_import(
         blocks,
@@ -180,9 +208,9 @@ def test_prepare_blocks_for_import_applies_constant_weight():
     assert prepared["block_grid_rgb"][0, 0, 1].item() == pytest.approx(8.0)
     assert prepared["block_grid_rgb"][0, 0, 2].item() == pytest.approx(12.0)
     assert prepared["block_grid_rgb"][0, 0, 3].item() == pytest.approx(4.0)
-    assert prepared["block_features"][0, 0].item() == pytest.approx(4.0)
-    assert prepared["block_features"][0, 1].item() == pytest.approx(12.0)
-    assert prepared["block_feature_weight"][0].item() == pytest.approx(4.0)
+    assert prepared["block_features"][0, 0, 0].item() == pytest.approx(4.0)
+    assert prepared["block_features"][0, 0, 1].item() == pytest.approx(12.0)
+    assert prepared["block_feature_weight"][0, 0].item() == pytest.approx(4.0)
 
 
 def test_prepare_blocks_for_import_rejects_low_constant_weight():
@@ -240,6 +268,7 @@ def make_storage(
     hash_capacity: int = 8,
     device: str = "cpu",
     feature_dim: int = 0,
+    feature_block_grid_size: int = 1,
     enable_static: bool = False,
 ) -> BlockSparseTSDF:
     cfg = BlockSparseTSDFCfg(
@@ -252,6 +281,7 @@ def make_storage(
         grid_shape=(8, 8, 8),
         block_size=2,
         feature_dim=feature_dim,
+        feature_block_grid_size=feature_block_grid_size,
         feature_grid_height=1 if feature_dim > 0 else None,
         feature_grid_width=1 if feature_dim > 0 else None,
         enable_static=enable_static,
@@ -295,7 +325,6 @@ def test_block_sparse_tsdf_export_import_compacts_active_blocks():
         [3.0, 6.0, 9.0, 3.0],
         dtype=torch.float16,
     )
-
     blocks = source.export_blocks()
     target = make_storage(max_blocks=6, hash_capacity=16)
     target.import_blocks(blocks)
@@ -347,6 +376,7 @@ def test_cuda_checkpoint_roundtrip_preserves_block_data(tmp_path):
         hash_capacity=8,
         device="cuda:0",
         feature_dim=3,
+        feature_block_grid_size=2,
         enable_static=True,
     )
     source.data.num_allocated.fill_(3)
@@ -402,19 +432,18 @@ def test_cuda_checkpoint_roundtrip_preserves_block_data(tmp_path):
         device="cuda:0",
     )
     expected_rgb = source.data.block_grid_rgb[active_pool_idx].detach().clone()
-
-    source.data.block_features[0] = torch.tensor(
+    source.data.block_features[0, 0] = torch.tensor(
         [2.0, 4.0, 6.0],
         dtype=torch.float16,
         device="cuda:0",
     )
-    source.data.block_features[2] = torch.tensor(
+    source.data.block_features[2, 0] = torch.tensor(
         [3.0, 6.0, 9.0],
         dtype=torch.float16,
         device="cuda:0",
     )
-    source.data.block_feature_weight[0] = 2.0
-    source.data.block_feature_weight[2] = 3.0
+    source.data.block_feature_weight[0, 0] = 2.0
+    source.data.block_feature_weight[2, 0] = 3.0
     expected_features = source.data.block_features[active_pool_idx].detach().clone()
     expected_feature_weight = source.data.block_feature_weight[active_pool_idx].detach().clone()
 
@@ -436,6 +465,7 @@ def test_cuda_checkpoint_roundtrip_preserves_block_data(tmp_path):
         hash_capacity=16,
         device="cuda:0",
         feature_dim=3,
+        feature_block_grid_size=2,
         enable_static=True,
     )
     target.import_blocks(checkpoint["blocks"])
@@ -466,9 +496,10 @@ def test_cuda_checkpoint_roundtrip_preserves_block_data(tmp_path):
         rgb_avg.detach().cpu(),
         torch.tensor([[0.5, 1.0, 1.5], [1.0, 2.0, 3.0]]),
     )
-    feature_avg = target.data.block_features[:2].float() / target.data.block_feature_weight[
-        :2
-    ].float().unsqueeze(-1)
+    feature_avg = (
+        target.data.block_features[:2, 0].float()
+        / target.data.block_feature_weight[:2, 0].float().unsqueeze(-1)
+    )
     torch.testing.assert_close(
         feature_avg.detach().cpu(),
         torch.tensor([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]]),

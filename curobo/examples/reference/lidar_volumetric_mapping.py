@@ -52,6 +52,12 @@ Run LiDAR volumetric mapping:
 
    python curobo/examples/reference/lidar_volumetric_mapping.py
 
+Export a final UV-textured mesh from rectified timestamp-matched RGB cameras:
+
+.. code-block:: bash
+
+   python curobo/examples/reference/lidar_volumetric_mapping.py --mesh-output output_lidar.glb
+
 Run feature mapping and text queries:
 
 .. code-block:: bash
@@ -80,7 +86,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -179,6 +185,100 @@ class CameraCalibration:
     image_paths: list[Path]
 
 
+@dataclass
+class FisheyeToPinholeRectifier:
+    """Rectify raw fisheye RGB into a pinhole image for mapper texturing."""
+
+    camera: CameraCalibration
+    torch_module: Any
+    sampling_grid: Any
+    intrinsics: Any
+
+    @classmethod
+    def from_camera(
+        cls,
+        camera: CameraCalibration,
+        torch_module: Any,
+    ) -> FisheyeToPinholeRectifier:
+        """Build a cached inverse fisheye sampling grid.
+
+        The rectified image keeps the raw image shape and uses a pinhole
+        intrinsic matrix with the same focal lengths and principal point as
+        the calibration file. This gives the mapper a standard pinhole RGB
+        camera without adding a dependency on OpenCV.
+        """
+        height = int(camera.image_height)
+        width = int(camera.image_width)
+        y, x = torch_module.meshgrid(
+            torch_module.arange(height, dtype=torch_module.float32),
+            torch_module.arange(width, dtype=torch_module.float32),
+            indexing="ij",
+        )
+        x_ray = (x - float(camera.cx)) / float(camera.fx)
+        y_ray = (y - float(camera.cy)) / float(camera.fy)
+        radius = torch_module.sqrt(x_ray * x_ray + y_ray * y_ray)
+        theta = torch_module.atan(radius)
+        theta2 = theta * theta
+        k1, k2, k3, k4 = (float(v) for v in camera.distortion)
+        theta_d = theta * (
+            1.0
+            + k1 * theta2
+            + k2 * theta2 * theta2
+            + k3 * theta2 * theta2 * theta2
+            + k4 * theta2 * theta2 * theta2 * theta2
+        )
+        scale = torch_module.ones_like(radius)
+        nonzero = radius > 1.0e-8
+        scale[nonzero] = theta_d[nonzero] / radius[nonzero]
+        raw_u = float(camera.fx) * x_ray * scale + float(camera.cx)
+        raw_v = float(camera.fy) * y_ray * scale + float(camera.cy)
+
+        grid_x = 2.0 * raw_u / float(max(width - 1, 1)) - 1.0
+        grid_y = 2.0 * raw_v / float(max(height - 1, 1)) - 1.0
+        sampling_grid = torch_module.stack((grid_x, grid_y), dim=-1).unsqueeze(0)
+        intrinsics = torch_module.tensor(
+            [
+                [camera.fx, 0.0, camera.cx],
+                [0.0, camera.fy, camera.cy],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=torch_module.float32,
+        )
+        return cls(
+            camera=camera,
+            torch_module=torch_module,
+            sampling_grid=sampling_grid.contiguous(),
+            intrinsics=intrinsics,
+        )
+
+    def rectify(self, image: np.ndarray) -> tuple[Any, Any]:
+        """Return rectified RGB uint8 tensor and pinhole intrinsics."""
+        image_tensor = (
+            self.torch_module.from_numpy(np.ascontiguousarray(image))
+            .to(dtype=self.torch_module.float32)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            / 255.0
+        )
+        rectified = self.torch_module.nn.functional.grid_sample(
+            image_tensor,
+            self.sampling_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        rectified_rgb = (
+            rectified[0]
+            .permute(1, 2, 0)
+            .clamp(0.0, 1.0)
+            .mul(255.0)
+            .round()
+            .to(dtype=self.torch_module.uint8)
+            .contiguous()
+        )
+        return rectified_rgb, self.intrinsics.clone()
+
+
 @dataclass(frozen=True)
 class RangeImageResult:
     range_image: np.ndarray
@@ -226,6 +326,9 @@ This fetches only:
 Run LiDAR volumetric mapping:
   python curobo/examples/reference/lidar_volumetric_mapping.py
 
+Export a final UV-textured mesh from rectified timestamp-matched RGB cameras:
+  python curobo/examples/reference/lidar_volumetric_mapping.py --mesh-output output_lidar.glb
+
 Run feature mapping and text queries:
   python curobo/examples/reference/lidar_volumetric_mapping.py --enable-features --max-frames 10
 """,
@@ -233,9 +336,18 @@ Run feature mapping and text queries:
     parser.add_argument("--sequence-dir", type=Path, default=DEFAULT_SEQUENCE_DIR)
     parser.add_argument("--curobo-root", type=Path, default=DEFAULT_CUROBO_ROOT)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--mesh-output",
+        type=Path,
+        default=None,
+        help=(
+            "Optional final mesh export path. Use .glb or .obj to save UV texture "
+            "coordinates projected from timestamp-matched RGB camera frames."
+        ),
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--start-index", type=int, default=0)
-    parser.add_argument("--max-frames", type=int, default=64, help="Use 0 for all frames.")
+    parser.add_argument("--max-frames", type=int, default=12, help="Use 0 for all frames.")
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--lidar-height", type=int, default=64)
     parser.add_argument("--lidar-width", type=int, default=1024)
@@ -269,7 +381,13 @@ Run feature mapping and text queries:
         default=DEFAULT_ESDF_SLICE_RESOLUTION,
         help="Pixel width and height of the Viser ESDF slice image.",
     )
-    parser.add_argument("--block-size", type=int, default=4)
+    parser.add_argument("--block-size", type=int, default=8)
+    parser.add_argument(
+        "--feature-block-grid-size",
+        type=int,
+        default=1,
+        help="Feature control points per block edge; independent from RGB resolution.",
+    )
     parser.add_argument(
         "--max-blocks",
         type=int,
@@ -291,6 +409,15 @@ Run feature mapping and text queries:
         help="Fuse C-RADIO patch features and enable Viser text-query overlays.",
     )
     parser.add_argument("--feature-model", default=RADIO_MODEL_NAME)
+    parser.add_argument(
+        "--texture-max-batches",
+        type=int,
+        default=16,
+        help=(
+            "Maximum RGB camera frame batches retained for final .glb/.obj "
+            "textured mesh export. Set 0 to save voxel-colored mesh."
+        ),
+    )
     parser.add_argument("--status-every", type=int, default=10)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -302,9 +429,10 @@ Run feature mapping and text queries:
         parser.error("--esdf-voxel-size must be positive")
     if args.esdf_slice_resolution <= 0:
         parser.error("--esdf-slice-resolution must be positive")
-    if args.output is None:
-        default_output = DEFAULT_FEATURE_OUTPUT if args.enable_features else DEFAULT_TSDF_OUTPUT
-        args.output = args.sequence_dir / default_output
+    if args.texture_max_batches < 0:
+        parser.error("--texture-max-batches must be non-negative")
+    if args.mesh_output is not None and args.mesh_output == args.output:
+        parser.error("--mesh-output must be different from --output")
     return args
 
 
@@ -852,66 +980,88 @@ def make_range_image(
 
     points = xyz[mask]
     ranges = ranges[mask]
+    source_idx = np.arange(points.shape[0], dtype=np.int64)
     elevation = elevation[mask]
     azimuth = np.arctan2(points[:, 1], points[:, 0])
-    u = np.mod(np.rint((azimuth + math.pi) * (image_width / (2.0 * math.pi))), image_width)
+    u = np.mod((azimuth + math.pi) * (image_width / (2.0 * math.pi)), image_width)
     if image_height == 1:
         v = np.zeros_like(u)
     else:
-        v = np.rint(
+        v = (
             (elevation_max_rad - elevation)
             * ((image_height - 1.0) / (elevation_max_rad - elevation_min_rad))
         )
-    u_i = u.astype(np.int64)
-    v_i = np.clip(v.astype(np.int64), 0, image_height - 1)
-    flat = v_i * image_width + u_i
 
-    order = np.lexsort((ranges, flat))
-    flat_sorted = flat[order]
+    u0 = np.floor(u).astype(np.int64)
+    u0 = np.mod(u0, image_width)
+    u1 = np.mod(u0 + 1, image_width)
+    if image_height == 1:
+        v0 = np.zeros_like(u0)
+        candidate_flat = np.concatenate((u0, u1))
+        candidate_source = np.concatenate((source_idx, source_idx))
+    else:
+        v0 = np.floor(v).astype(np.int64)
+        v0 = np.clip(v0, 0, image_height - 1)
+        v1 = np.clip(v0 + 1, 0, image_height - 1)
+        candidate_flat = np.concatenate(
+            (
+                v0 * image_width + u0,
+                v0 * image_width + u1,
+                v1 * image_width + u0,
+                v1 * image_width + u1,
+            )
+        )
+        candidate_source = np.concatenate((source_idx, source_idx, source_idx, source_idx))
+
+    candidate_ranges = ranges[candidate_source]
+    order = np.lexsort((candidate_ranges, candidate_flat))
+    flat_sorted = candidate_flat[order]
     first = np.empty(flat_sorted.shape[0], dtype=bool)
     first[0] = True
     first[1:] = flat_sorted[1:] != flat_sorted[:-1]
-    winners = order[first]
+    winner_candidates = order[first]
+    winner_source = candidate_source[winner_candidates]
+    winner_flat = candidate_flat[winner_candidates]
 
     range_flat = np.zeros(image_height * image_width, dtype=np.float32)
-    range_flat[flat[winners]] = ranges[winners]
+    range_flat[winner_flat] = ranges[winner_source]
 
     rgb_flat = np.zeros((image_height * image_width, 3), dtype=np.uint8)
     if point_colors is None:
         colors = colorize_points(
-            points[winners],
-            intensity[mask][winners] if intensity is not None else None,
+            points[winner_source],
+            intensity[mask][winner_source] if intensity is not None else None,
             color_mode,
         )
         camera_rgb_pixels = 0
     else:
-        colors = point_colors[mask][winners]
+        colors = point_colors[mask][winner_source]
         camera_rgb_pixels = (
-            int(camera_color_mask[mask][winners].sum())
+            int(camera_color_mask[mask][winner_source].sum())
             if camera_color_mask is not None
             else 0
         )
-    rgb_flat[flat[winners]] = colors
+    rgb_flat[winner_flat] = colors
     feature_grid = None
     feature_pixels = 0
     if point_features is not None:
         feature_dim = int(point_features.shape[1])
         feature_flat = np.zeros((image_height * image_width, feature_dim), dtype=np.float16)
-        winner_features = point_features[mask][winners].copy()
+        winner_features = point_features[mask][winner_source].copy()
         if feature_mask is not None:
-            winner_feature_mask = feature_mask[mask][winners]
+            winner_feature_mask = feature_mask[mask][winner_source]
             feature_pixels = int(winner_feature_mask.sum())
             if feature_pixels > 0:
                 mean_feature = winner_features[winner_feature_mask].astype(np.float32).mean(axis=0)
                 winner_features[~winner_feature_mask] = mean_feature.astype(np.float16)
-        feature_flat[flat[winners]] = winner_features
+        feature_flat[winner_flat] = winner_features
         feature_grid = feature_flat.reshape(image_height, image_width, feature_dim)
     return RangeImageResult(
         range_image=range_flat.reshape(image_height, image_width),
         rgb_image=rgb_flat.reshape(image_height, image_width, 3),
-        projected_pixels=int(winners.size),
+        projected_pixels=int(winner_source.size),
         camera_rgb_pixels=camera_rgb_pixels,
-        sample_points_base=points[winners],
+        sample_points_base=points[winner_source],
         sample_colors=colors,
         feature_grid=feature_grid,
         feature_pixels=feature_pixels,
@@ -1043,10 +1193,27 @@ def tsdf_surface_voxels_with_blocks(mapper) -> tuple[np.ndarray, np.ndarray, np.
     ).astype(np.float32)
 
     rgbw = blocks["block_grid_rgb"].to(device="cpu").float().numpy()
-    weight_rgb = np.clip(rgbw[block_idx, 0, 3:4], 1e-6, None)
-    colors = np.clip((rgbw[block_idx, 0, :3] / weight_rgb) * 255.0, 0.0, 255.0).astype(
+    color_grid_size = int(mapper.config.color_grid_size)
+    if color_grid_size <= 1 or block_size <= 1:
+        rgb_node_idx = np.zeros_like(block_idx, dtype=np.int64)
+    else:
+        grid_max = float(color_grid_size - 1)
+        scale = grid_max / float(block_size - 1)
+        rgb_grid = np.clip(local_xyz * scale, 0.0, grid_max)
+        rgb_grid_idx = np.floor(rgb_grid + 0.5).astype(np.int64)
+        rgb_node_idx = (
+            rgb_grid_idx[:, 2] * color_grid_size * color_grid_size
+            + rgb_grid_idx[:, 1] * color_grid_size
+            + rgb_grid_idx[:, 0]
+        )
+    sampled_rgbw = rgbw[block_idx, rgb_node_idx]
+    weight_rgb = np.clip(sampled_rgbw[:, 3:4], 1e-6, None)
+    colors = np.clip((sampled_rgbw[:, :3] / weight_rgb) * 255.0, 0.0, 255.0).astype(
         np.uint8
     )
+    missing_rgb = sampled_rgbw[:, 3] <= 1e-6
+    if missing_rgb.any():
+        colors[missing_rgb] = 128
     return centers, colors, block_idx.astype(np.int64), blocks
 
 
@@ -1131,7 +1298,7 @@ def update_viser_tsdf_voxels(visualizer, mapper, voxel_size: float) -> int:
         visualizer.add_point_cloud(
             pointcloud=tsdf_points,
             colors=tsdf_colors,
-            point_size=max(0.025, voxel_size * 1.5),
+            point_size=max(0.025, voxel_size),
             name=VISER_TSDF_POINTCLOUD_NAME,
         )
     return int(tsdf_points.shape[0])
@@ -1144,6 +1311,124 @@ def pose_from_transform(T: np.ndarray, Pose, torch_module):
         dtype=torch_module.float32,
     )
     return Pose(position=position, quaternion=quaternion, normalize_rotation=True)
+
+
+def uses_textured_mesh_export(args: argparse.Namespace) -> bool:
+    return (
+        args.mesh_output is not None
+        and args.mesh_output.suffix.lower() in {".glb", ".obj"}
+        and args.texture_max_batches > 0
+    )
+
+
+def texture_camera_shape(cameras: list[CameraCalibration]) -> tuple[int, int, int]:
+    image_height = cameras[0].image_height
+    image_width = cameras[0].image_width
+    for camera in cameras:
+        if camera.image_height != image_height or camera.image_width != image_width:
+            raise RuntimeError(
+                "Textured mesh export requires all RGB cameras to share "
+                "the same image shape."
+            )
+    return image_height, image_width, len(cameras)
+
+
+def make_texture_observation(
+    frame: Frame,
+    cameras: list[CameraCalibration],
+    rectifiers: dict[str, FisheyeToPinholeRectifier],
+    CameraObservation: type,
+    Pose: type,
+    torch_module: Any,
+) -> object | None:
+    rgb_images = []
+    intrinsics = []
+    positions = []
+    quaternions = []
+    for camera in cameras:
+        image_path = find_camera_image(camera, frame.pose)
+        if image_path is None:
+            return None
+        image = load_rgb_image(image_path)
+        expected_shape = (camera.image_height, camera.image_width, 3)
+        if image.shape != expected_shape:
+            raise RuntimeError(
+                f"{image_path} shape mismatch: expected {expected_shape}, got {image.shape}."
+            )
+        rectified_rgb, rectified_intrinsics = rectifiers[camera.name].rectify(image)
+        T_world_cam = camera_world_transform(frame, camera)
+        rgb_images.append(rectified_rgb)
+        intrinsics.append(rectified_intrinsics)
+        positions.append(torch_module.tensor(T_world_cam[:3, 3], dtype=torch_module.float32))
+        quaternions.append(
+            torch_module.tensor(
+                quat_wxyz_from_matrix(T_world_cam[:3, :3]),
+                dtype=torch_module.float32,
+            )
+        )
+
+    return CameraObservation(
+        rgb_image=torch_module.stack(rgb_images),
+        pose=Pose(
+            position=torch_module.stack(positions),
+            quaternion=torch_module.stack(quaternions),
+            normalize_rotation=True,
+        ),
+        intrinsics=torch_module.stack(intrinsics),
+    )
+
+
+def flip_texture_image_for_glb(mesh: Any, torch_module: Any) -> None:
+    """Counter Trimesh's GLB export-time UV V flip without changing mapper UVs."""
+    if mesh.texture_image is None:
+        return
+    if isinstance(mesh.texture_image, torch_module.Tensor):
+        mesh.texture_image = torch_module.flip(mesh.texture_image, dims=(0,))
+    else:
+        mesh.texture_image = np.flip(mesh.texture_image, axis=0).copy()
+
+
+def save_final_mesh_export(
+    mapper: Any,
+    args: argparse.Namespace,
+    texture_observations: list[object],
+    torch_module: Any,
+) -> None:
+    if args.mesh_output is None:
+        return
+
+    output_suffix = args.mesh_output.suffix.lower()
+    use_textured_mesh = bool(
+        texture_observations and output_suffix in {".glb", ".obj"}
+    )
+    if use_textured_mesh:
+        print(
+            "Using "
+            f"{len(texture_observations)} RGB camera batches for textured mesh export"
+        )
+        mesh = mapper.extract_textured_mesh(
+            texture_observations,
+            surface_only=False,
+        )
+    else:
+        if output_suffix in {".glb", ".obj"}:
+            print("No retained RGB camera batches available; saving voxel-colored mesh")
+        mesh = mapper.extract_mesh(surface_only=False)
+
+    if mesh.vertices is None or len(mesh.vertices) == 0:
+        print("No mesh extracted (empty reconstruction)")
+        return
+
+    if output_suffix not in {".glb", ".obj"}:
+        mesh.texture_uvs = None
+        mesh.texture_image = None
+    elif output_suffix == ".glb":
+        flip_texture_image_for_glb(mesh, torch_module)
+
+    args.mesh_output.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Saving mesh to {args.mesh_output}")
+    mesh.save_as_mesh(str(args.mesh_output))
+    print(f"Saved mesh: {args.mesh_output} ({len(mesh.vertices):,} vertices)")
 
 
 def synchronize_if_cuda(torch_module, device) -> None:
@@ -1303,9 +1588,9 @@ def update_viser_feature_voxels(
     if points.shape[0] == 0 or "block_features" not in blocks:
         return 0, pca_basis
 
-    block_features = blocks["block_features"].float()
-    block_weight = blocks["block_feature_weight"].float().clamp(min=1e-6).unsqueeze(1)
-    normalized_features = block_features / block_weight
+    block_features = blocks["block_features"].float().sum(dim=1)
+    block_weight = blocks["block_feature_weight"].float().sum(dim=1).clamp(min=1e-6)
+    normalized_features = block_features / block_weight.unsqueeze(1)
     block_colors, pca_basis = pca_colorize_tensor(normalized_features, prev_basis=pca_basis)
     colors = block_colors[block_idx].cpu().numpy()
     points, colors = downsample_points(points, colors, VISER_MAX_FEATURE_POINTS)
@@ -1511,13 +1796,30 @@ def run_mapper(args: argparse.Namespace, frames: list[Frame], bounds: Bounds) ->
         )
 
     cameras = load_camera_calibrations(args.sequence_dir)
+    texture_export = uses_textured_mesh_export(args)
+    if texture_export:
+        (
+            texture_camera_image_height,
+            texture_camera_image_width,
+            texture_num_cameras,
+        ) = texture_camera_shape(cameras)
+    else:
+        texture_camera_image_height = None
+        texture_camera_image_width = None
+        texture_num_cameras = None
 
+    from curobo._src.types.camera import CameraObservation
     from curobo._src.perception.mapper.mapper import Mapper
     from curobo._src.perception.mapper.mapper_cfg import MapperCfg
     from curobo._src.types.lidar import LidarObservation
     from curobo._src.types.pose import Pose
     from curobo._src.util.warp import init_warp
 
+    texture_rectifiers = (
+        {camera.name: FisheyeToPinholeRectifier.from_camera(camera, torch) for camera in cameras}
+        if texture_export
+        else {}
+    )
     feature_model = None
     feature_dim = 0
     feature_shape_hw: tuple[int, int] | None = None
@@ -1556,6 +1858,9 @@ def run_mapper(args: argparse.Namespace, frames: list[Frame], bounds: Bounds) ->
         "image_height": 1,
         "image_width": 1,
         "num_cameras": 1,
+        "texture_num_cameras": texture_num_cameras,
+        "texture_camera_image_height": texture_camera_image_height,
+        "texture_camera_image_width": texture_camera_image_width,
         "lidar_num_sensors": 1,
         "lidar_image_height": int(args.lidar_height),
         "lidar_image_width": int(args.lidar_width),
@@ -1564,7 +1869,8 @@ def run_mapper(args: argparse.Namespace, frames: list[Frame], bounds: Bounds) ->
         "extent_esdf_meters_xyz": (float(args.esdf_extent_meters),) * 3,
         "esdf_voxel_size": float(args.esdf_voxel_size),
         "device": args.device,
-        "minimum_tsdf_weight": 0.0001,
+        "minimum_tsdf_weight": 2.0,
+        "color_grid_size": int(args.block_size),
     }
     if args.enable_features:
         cfg_kwargs.update(
@@ -1572,6 +1878,7 @@ def run_mapper(args: argparse.Namespace, frames: list[Frame], bounds: Bounds) ->
                 "lidar_feature_grid_height": int(args.lidar_height),
                 "lidar_feature_grid_width": int(args.lidar_width),
                 "feature_dim": feature_dim,
+                "feature_block_grid_size": int(args.feature_block_grid_size),
                 "feature_grid_height": int(args.lidar_height),
                 "feature_grid_width": int(args.lidar_width),
                 "feature_integration_kernel": "grouped",
@@ -1581,6 +1888,13 @@ def run_mapper(args: argparse.Namespace, frames: list[Frame], bounds: Bounds) ->
     cfg = MapperCfg(**cfg_kwargs)
     mapper = Mapper(cfg)
     print(f"Mapper initialized: {mapper.memory_usage_mb():.1f} MB")
+    if texture_export:
+        print(
+            "Textured mesh export enabled: "
+            f"{texture_num_cameras} RGB cameras, "
+            f"image_shape=({texture_camera_image_height}, {texture_camera_image_width}), "
+            f"max_batches={args.texture_max_batches}"
+        )
     if args.esdf_every > 0:
         esdf_grid_shape = tuple(
             int(math.ceil(args.esdf_extent_meters / args.esdf_voxel_size)) for _ in range(3)
@@ -1619,6 +1933,14 @@ def run_mapper(args: argparse.Namespace, frames: list[Frame], bounds: Bounds) ->
     camera_feature_pixels = 0
     camera_rgb_counts = {camera.name: 0 for camera in cameras}
     camera_feature_counts = {camera.name: 0 for camera in cameras}
+    texture_frames: list[Frame] = []
+    if texture_export:
+        texture_frame_stride = max(
+            1,
+            (len(frames) + args.texture_max_batches - 1) // args.texture_max_batches,
+        )
+    else:
+        texture_frame_stride = 0
     for i, frame in enumerate(frames):
         xyz, intensity = read_binary_pcd_xyz_intensity(frame.cloud_path)
         fallback_colors = colorize_points(xyz, intensity, args.color_mode)
@@ -1697,6 +2019,12 @@ def run_mapper(args: argparse.Namespace, frames: list[Frame], bounds: Bounds) ->
         tsdf_ms = (time.perf_counter() - tsdf_t0) * 1000.0
 
         integrated += 1
+        if (
+            texture_frame_stride > 0
+            and i % texture_frame_stride == 0
+            and len(texture_frames) < args.texture_max_batches
+        ):
+            texture_frames.append(frame)
         esdf_ms = None
         esdf_slice_ms = None
         esdf_shape = None
@@ -1762,36 +2090,54 @@ def run_mapper(args: argparse.Namespace, frames: list[Frame], bounds: Bounds) ->
                 status += f" feature_pixels={range_result.feature_pixels}"
             print(status)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    mapper.save_blocks(args.output)
-    stats = mapper.get_stats(scan_pool=True, scan_hash=False)
-    metadata = build_metadata(
-        args,
-        frames,
-        bounds,
-        stats,
-        projected_points,
-        integrated,
-        camera_rgb_pixels,
-        camera_rgb_counts,
-        feature_pixels=camera_feature_pixels if args.enable_features else None,
-        camera_feature_counts=camera_feature_counts if args.enable_features else None,
-        feature_dim=feature_dim if args.enable_features else None,
-        feature_shape_hw=feature_shape_hw,
-    )
-    write_metadata(args.output, metadata)
-    print(f"saved {args.output}")
-    print(f"saved {args.output.with_suffix(args.output.suffix + '.json')}")
-    print(
-        json.dumps(
-            {
-                k: stats[k]
-                for k in ("frame_count", "active_blocks", "num_allocated", "memory_mb")
-                if k in stats
-            },
-            indent=2,
+
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        mapper.save_blocks(args.output)
+    texture_observations: list[CameraObservation] = []
+    if texture_export:
+        for texture_frame in texture_frames:
+            texture_observation = make_texture_observation(
+                texture_frame,
+                cameras,
+                texture_rectifiers,
+                CameraObservation,
+                Pose,
+                torch,
+            )
+            if texture_observation is not None:
+                texture_observations.append(texture_observation)
+    save_final_mesh_export(mapper, args, texture_observations, torch)
+    if args.output is not None:
+        stats = mapper.get_stats(scan_pool=True, scan_hash=False)
+        metadata = build_metadata(
+            args,
+            frames,
+            bounds,
+            stats,
+            projected_points,
+            integrated,
+            camera_rgb_pixels,
+            camera_rgb_counts,
+            feature_pixels=camera_feature_pixels if args.enable_features else None,
+            camera_feature_counts=camera_feature_counts if args.enable_features else None,
+            feature_dim=feature_dim if args.enable_features else None,
+            feature_shape_hw=feature_shape_hw,
+            texture_batches=len(texture_observations),
         )
-    )
+        write_metadata(args.output, metadata)
+        print(f"saved {args.output}")
+        print(f"saved {args.output.with_suffix(args.output.suffix + '.json')}")
+        print(
+            json.dumps(
+                {
+                    k: stats[k]
+                    for k in ("frame_count", "active_blocks", "num_allocated", "memory_mb")
+                    if k in stats
+                },
+                indent=2,
+            )
+        )
     keep_viser_alive(
         viser_port,
         enable_features=args.enable_features,
@@ -1812,6 +2158,7 @@ def build_metadata(
     camera_feature_counts: dict[str, int] | None = None,
     feature_dim: int | None = None,
     feature_shape_hw: tuple[int, int] | None = None,
+    texture_batches: int = 0,
 ) -> dict:
     extent_xyz = np.asarray(args.extent_meters_xyz, dtype=np.float32) if args.extent_meters_xyz else bounds.extent_xyz
     center = np.asarray(args.grid_center, dtype=np.float32) if args.grid_center else bounds.center
@@ -1844,6 +2191,12 @@ def build_metadata(
         "block_size": args.block_size,
         "max_blocks": args.max_blocks,
         "roughness": args.roughness,
+        "mesh_output": None if args.mesh_output is None else str(args.mesh_output),
+        "texture_max_batches": args.texture_max_batches,
+        "texture_batches": texture_batches,
+        "texture_rectification": (
+            "fisheye_to_pinhole" if texture_batches > 0 else None
+        ),
         "mapper_stats": stats,
     }
     if args.enable_features:
@@ -1852,6 +2205,7 @@ def build_metadata(
                 "feature_model": args.feature_model,
                 "text_adaptor": TEXT_ADAPTOR_NAME,
                 "feature_dim": feature_dim,
+                "feature_block_grid_size": args.feature_block_grid_size,
                 "feature_grid_shape_hw": (
                     None if feature_shape_hw is None else list(feature_shape_hw)
                 ),
@@ -1923,6 +2277,8 @@ def print_dry_run(args: argparse.Namespace, frames: list[Frame], bounds: Bounds)
                 "esdf_slice_resolution": args.esdf_slice_resolution,
                 "block_size": args.block_size,
                 "output": str(args.output),
+                "mesh_output": None if args.mesh_output is None else str(args.mesh_output),
+                "texture_max_batches": args.texture_max_batches,
             },
             indent=2,
         )

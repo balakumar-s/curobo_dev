@@ -106,20 +106,41 @@ def _validate_block_size(block_size: int) -> None:
         )
 
 
+def _validate_block_grid_size(
+    grid_size: int,
+    block_size: int,
+    field_name: str,
+) -> None:
+    """Validate a compile-time per-block control-grid resolution."""
+    if not isinstance(grid_size, int) or isinstance(grid_size, bool):
+        log_and_raise(
+            f"{field_name} must be a plain int, got "
+            f"{type(grid_size).__name__} ({grid_size!r})."
+        )
+    if grid_size < 1:
+        log_and_raise(f"{field_name} must be >= 1, got {grid_size}.")
+    if grid_size > block_size:
+        log_and_raise(
+            f"{field_name} must be <= block_size, got "
+            f"{field_name}={grid_size}, block_size={block_size}."
+        )
+
+
 def _validate_color_grid_size(color_grid_size: int, block_size: int) -> None:
     """Validate the compile-time RGB control-grid resolution."""
-    if not isinstance(color_grid_size, int) or isinstance(color_grid_size, bool):
-        log_and_raise(
-            "color_grid_size must be a plain int, got "
-            f"{type(color_grid_size).__name__} ({color_grid_size!r})."
-        )
-    if color_grid_size < 1:
-        log_and_raise(f"color_grid_size must be >= 1, got {color_grid_size}.")
-    if color_grid_size > block_size:
-        log_and_raise(
-            "color_grid_size must be <= block_size, got "
-            f"color_grid_size={color_grid_size}, block_size={block_size}."
-        )
+    _validate_block_grid_size(color_grid_size, block_size, "color_grid_size")
+
+
+def _validate_feature_block_grid_size(
+    feature_block_grid_size: int,
+    block_size: int,
+) -> None:
+    """Validate the compile-time feature control-grid resolution."""
+    _validate_block_grid_size(
+        feature_block_grid_size,
+        block_size,
+        "feature_block_grid_size",
+    )
 
 
 def _validate_feature_channels_per_thread(feature_channels_per_thread: int) -> None:

@@ -141,8 +141,8 @@ def apply_decay_from_frustum_flags(
     tsdf.data.block_data[:n].mul_(factor.view(n, 1, 1))
     tsdf.data.block_grid_rgb[:n].mul_(factor.view(n, 1, 1))
     if tsdf.data.has_features:
-        tsdf.data.block_features[:n].mul_(factor.view(n, 1))
-        tsdf.data.block_feature_weight[:n].mul_(factor)
+        tsdf.data.block_features[:n].mul_(factor.view(n, 1, 1))
+        tsdf.data.block_feature_weight[:n].mul_(factor.view(n, 1))
 
     tsdf.data.block_sums[:n] = tsdf.data.block_data[:n, :, 1].sum(dim=1, dtype=torch.float32)
 

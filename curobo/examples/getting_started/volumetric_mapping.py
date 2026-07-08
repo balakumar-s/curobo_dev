@@ -102,6 +102,11 @@ same mapper configuration values and pass ``--resume-from``:
      --root ./datasets/sun3d/sun3d-mit_76_studyroom-76-1studyroom2 \\
      --resume-from ~/.cache/curobo/examples/volumetric_mapping/tsdf_blocks.pt
 
+When ``--visualize`` is set, the live reconstruction preview uses surface
+voxels split into smaller points and colors those points from the current RGB-D
+frame using the mapper's visibility-tested texture path. This avoids extracting
+a mesh during depth fusion while still showing a higher-resolution color preview.
+
 Step 3: Check the output
 ---------------------------
 
@@ -117,7 +122,7 @@ When the tutorial finishes successfully you will see::
 
     Computing ESDF...
     Extracting mesh...
-    Saved mesh: output_mesh.ply (150,000 vertices)
+    Saved mesh: output_mesh.glb (150,000 vertices)
 
 The following files are written to ``~/.cache/curobo/examples/volumetric_mapping/``
 (override with ``curobo._src.runtime.cache_dir``):
@@ -125,9 +130,11 @@ The following files are written to ``~/.cache/curobo/examples/volumetric_mapping
 - ``rendered_depth.png``: depth colormap rendered from the first camera pose
 - ``rendered_normals.png``: surface normal colormap
 - ``rendered_shaded.png``: Phong-shaded surface view
-- ``output_mesh.ply``: colored triangle mesh of the full reconstruction
+- ``output_mesh.glb``: textured triangle mesh of the full reconstruction
 - ``tsdf_blocks.pt``: compact mapper block checkpoint when ``--checkpoint`` is set
 """
+
+from __future__ import annotations
 
 import argparse
 import os
@@ -148,6 +155,10 @@ from curobo.profiling import CudaEventTimer
 from curobo.scene import Cuboid, Mesh, SceneData
 from curobo.types import CameraObservation, DeviceCfg, Pose
 from curobo.viewer import ViserVisualizer
+
+LIVE_PREVIEW_MAX_POINTS = 200_000
+LIVE_PREVIEW_PERIOD_FRAMES = 20
+LIVE_PREVIEW_SUBVOXEL_FACTOR = 1
 
 
 def create_scene_with_static_obstacles(device: str = "cuda:0") -> SceneData:
@@ -278,6 +289,48 @@ def extract_esdf_slice(
     return colors
 
 
+def extract_textured_subvoxel_preview(
+    mapper: Mapper,
+    *,
+    observation: CameraObservation | None,
+    subvoxel_factor: int = LIVE_PREVIEW_SUBVOXEL_FACTOR,
+    max_points: int = LIVE_PREVIEW_MAX_POINTS,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract visibility-textured surface subvoxels for live visualization."""
+    voxels = mapper.extract_occupied_voxels(
+        surface_only=True,
+        subvoxel_factor=subvoxel_factor,
+        max_points=max_points,
+        texture_observations=observation,
+    )
+    points = voxels.centers
+    colors = voxels.colors_uint8()
+    del voxels
+    return points, colors
+
+
+def flip_texture_image_for_glb(mesh: Mesh) -> None:
+    """Counter Trimesh's GLB export-time UV V flip without changing mapper UVs."""
+    if mesh.texture_image is None:
+        return
+    if isinstance(mesh.texture_image, torch.Tensor):
+        mesh.texture_image = torch.flip(mesh.texture_image, dims=(0,))
+    else:
+        mesh.texture_image = np.flip(mesh.texture_image, axis=0).copy()
+
+
+def clone_texture_observation(observation: CameraObservation) -> CameraObservation:
+    """Keep only RGB, pose, and intrinsics needed for final texture projection."""
+    return CameraObservation(
+        rgb_image=observation.rgb_image.detach().clone(),
+        pose=Pose(
+            position=observation.pose.position.detach().clone(),
+            quaternion=observation.pose.quaternion.detach().clone(),
+        ),
+        intrinsics=observation.intrinsics.detach().clone(),
+    )
+
+
 class Sun3dDataset(Dataset):
     """Sun3D RGB-D dataset loader."""
 
@@ -337,9 +390,18 @@ def main():
     parser.add_argument("--root", type=str, required=True, help="Sun3D dataset root path")
     parser.add_argument("--voxel-size", type=float, default=0.02, help="Voxel size (m)")
     parser.add_argument("--max-frames", type=int, default=10000, help="Max frames to process")
-    parser.add_argument("--output", type=str, default="output_mesh.ply", help="Output mesh")
+    parser.add_argument("--output", type=str, default="output_mesh.glb", help="Output mesh")
     parser.add_argument("--visualize", action="store_true", help="Enable viser visualization")
     parser.add_argument("--num-cameras", type=int, default=1, help="Number of cameras")
+    parser.add_argument(
+        "--texture-max-batches",
+        type=int,
+        default=50,
+        help=(
+            "Maximum number of integrated camera batches retained for final "
+            "textured mesh export. Set 0 to save voxel-colored mesh only."
+        ),
+    )
     parser.add_argument(
         "--checkpoint",
         type=Path,
@@ -358,6 +420,8 @@ def main():
     args = parser.parse_args()
     if args.checkpoint is not None and args.resume_from is not None:
         raise ValueError("--checkpoint and --resume-from are mutually exclusive")
+    if args.texture_max_batches < 0:
+        raise ValueError("--texture-max-batches must be >= 0")
     checkpoint_path = args.checkpoint.expanduser() if args.checkpoint is not None else None
     resume_path = args.resume_from.expanduser() if args.resume_from is not None else None
 
@@ -374,7 +438,7 @@ def main():
         truncation_distance=args.voxel_size * 6,
         depth_maximum_distance=6.0,
         depth_minimum_distance=0.05,
-        minimum_tsdf_weight=2.0,
+        minimum_tsdf_weight=4.0,
         decay_factor=1.0,
         frustum_decay_factor=1.0,
         # enable_static=True allocates a separate geometry channel for analytic
@@ -385,6 +449,8 @@ def main():
         num_cameras=args.num_cameras,
         image_height=480,
         image_width=640,
+        block_size=8,
+        color_grid_size=8,
     )
     if resume_path is None:
         mapper = Mapper(config)
@@ -448,6 +514,16 @@ def main():
     n_cams = args.num_cameras
     pbar = tqdm(range(0, max_frames, n_cams))
     dt_s_list = []
+    latest_preview_observation: CameraObservation | None = None
+    texture_observations: list[CameraObservation] = []
+    total_batches = (max_frames + n_cams - 1) // n_cams if max_frames > 0 else 0
+    if args.texture_max_batches > 0 and total_batches > 0:
+        texture_batch_stride = max(
+            1,
+            (total_batches + args.texture_max_batches - 1) // args.texture_max_batches,
+        )
+    else:
+        texture_batch_stride = 0
     for batch_start in pbar:
         batch_end = min(batch_start + n_cams, max_frames)
         batch_obs = []
@@ -495,40 +571,50 @@ def main():
         timer = CudaEventTimer().start()
         mapper.integrate(batched)
         dt_s = timer.stop()
+        latest_preview_observation = batched
+
+        batch_idx = batch_start // n_cams
+        if (
+            texture_batch_stride > 0
+            and batch_idx % texture_batch_stride == 0
+            and len(texture_observations) < args.texture_max_batches
+        ):
+            texture_observations.append(clone_texture_observation(batched))
 
         dt_s_list.append(dt_s)
-        pbar.set_postfix(
-            load_ms=f"{t_load * 1000:.0f}",
-            filter_ms=f"{t_filter * 1000:.0f}",
-            integrate_ms=f"{np.mean(dt_s_list) * 1000:.1f}",
-            n_cams=n_cams,
-        )
+        postfix = {
+            "load_ms": f"{t_load * 1000:.0f}",
+            "filter_ms": f"{t_filter * 1000:.0f}",
+            "integrate_ms": f"{np.mean(dt_s_list) * 1000:.1f}",
+            "n_cams": n_cams,
+        }
+
         if len(dt_s_list) > 10:
             dt_s_list = dt_s_list[-10:]
 
-        if visualizer and (batch_end) % 20 < n_cams:
-            voxels = mapper.integrator.extract_occupied_voxels(surface_only=False)
-            if len(voxels) > 0:
-                centers = voxels.centers
-                colors = voxels.colors_uint8()
-                if len(centers) > 100_000:
-                    scale = int(len(centers) / 100_000)
-                    if scale > 1:
-                        centers = centers[::scale]
-                        colors = colors[::scale]
-
-                points_np = centers.cpu().numpy()
+        if visualizer and (batch_end) % LIVE_PREVIEW_PERIOD_FRAMES < n_cams:
+            t0 = time.perf_counter()
+            points, colors = extract_textured_subvoxel_preview(
+                mapper,
+                observation=batched,
+            )
+            preview_dt = time.perf_counter() - t0
+            postfix["preview_ms"] = f"{preview_dt * 1000:.0f}"
+            postfix["preview_points"] = f"{len(points):,}"
+            if len(points) > 0:
+                points_np = points.cpu().numpy()
                 colors_np = colors.cpu().numpy()
                 visualizer.add_point_cloud(
                     pointcloud=points_np,
                     colors=colors_np,
-                    point_size=args.voxel_size,
+                    point_size=args.voxel_size / LIVE_PREVIEW_SUBVOXEL_FACTOR,
                     name="/reconstruction",
                 )
-                del centers, colors, points_np, colors_np
-            del voxels
+                del points_np, colors_np
+            del points, colors
             torch.cuda.empty_cache()
 
+        if visualizer and (batch_end) % LIVE_PREVIEW_PERIOD_FRAMES < n_cams:
             for cam_i, vis_obs in enumerate(batch_obs):
                 visualizer.add_frame(
                     f"/cameras/frame_{cam_i}", vis_obs.pose, scale=0.1,
@@ -546,6 +632,7 @@ def main():
                     pose=vis_obs.pose,
                     name=f"/cameras/image_{cam_i}",
                 )
+        pbar.set_postfix(**postfix)
 
     if checkpoint_path is not None:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -565,27 +652,69 @@ def main():
     print("Static obstacles stamped into TSDF geometry channel")
 
     if visualizer:
-        voxels = mapper.integrator.extract_occupied_voxels(surface_only=False)
-        if len(voxels) > 0:
-            centers = voxels.centers
-            colors = voxels.colors_uint8()
-            print(f"Extracted {len(centers)} voxels (with static obstacles)")
-            if len(centers) > 100_000:
-                scale = int(len(centers) / 100_000)
-                if scale > 1:
-                    centers = centers[::scale]
-                    colors = colors[::scale]
-            points_np = centers.cpu().numpy()
+        points, colors = extract_textured_subvoxel_preview(
+            mapper,
+            observation=latest_preview_observation,
+        )
+        print(f"Extracted {len(points):,} textured subvoxel preview points")
+        if len(points) > 0:
+            points_np = points.cpu().numpy()
             colors_np = colors.cpu().numpy()
             visualizer.add_point_cloud(
                 pointcloud=points_np,
                 colors=colors_np,
-                point_size=args.voxel_size,
+                point_size=args.voxel_size / LIVE_PREVIEW_SUBVOXEL_FACTOR,
                 name="/reconstruction",
             )
-            del centers, colors, points_np, colors_np
-        del voxels
+            del points_np, colors_np
+        del points, colors
         torch.cuda.empty_cache()
+
+    # Compute the ESDF over the workspace. The ESDF is generated at a coarser
+    # resolution than the TSDF, fine enough for robot collision spheres but
+    # cheap enough to recompute after each depth update. At query time, cuRobo
+    # uses trilinear interpolation over this grid for O(1) distance lookups.
+    print("\nComputing ESDF...")
+    voxel_grid = mapper.compute_esdf()
+    if voxel_grid.feature_tensor is not None:
+        print(
+            f"  ESDF shape: {voxel_grid.feature_tensor.shape}, "
+            f"voxel_size: {voxel_grid.voxel_size:.4f}m"
+        )
+
+    # Extract and save mesh
+    print("\nExtracting mesh...")
+    output_path = Path(args.output)
+    output_suffix = output_path.suffix.lower()
+    use_textured_mesh = (
+        len(texture_observations) > 0 and output_suffix in {".glb", ".obj"}
+    )
+    if use_textured_mesh:
+        print(
+            "Using "
+            f"{len(texture_observations)} RGB camera batches for textured mesh export"
+        )
+        mesh = mapper.extract_textured_mesh(
+            texture_observations,
+            surface_only=True,
+            refine_iterations=2,
+        )
+    else:
+        if output_suffix in {".glb", ".obj"} and len(texture_observations) == 0:
+            print("No retained RGB batches available; saving voxel-colored mesh")
+        mesh = mapper.extract_mesh(surface_only=False)
+    if mesh.vertices is not None and len(mesh.vertices) > 0:
+        if output_suffix not in {".glb", ".obj"}:
+            mesh.texture_uvs = None
+            mesh.texture_image = None
+        elif output_suffix == ".glb":
+            flip_texture_image_for_glb(mesh)
+        print(f"Saving mesh to {output_path}")
+        mesh.save_as_mesh(str(output_path))
+        print(f"Saved mesh: {output_path} ({len(mesh.vertices):,} vertices)")
+
+    else:
+        print("No mesh extracted (empty reconstruction)")
 
     # Render from first camera pose
     print("\nRendering from first camera pose. First call will take minutes to compile kernel.")
@@ -620,29 +749,6 @@ def main():
         iio.imwrite(str(out / "rendered_normals.png"), normal_colormap.cpu().numpy())
         iio.imwrite(str(out / "rendered_shaded.png"), shaded.cpu().numpy())
         print(f"Saved renders to: {out}")
-
-    # Compute the ESDF over the workspace. The ESDF is generated at a coarser
-    # resolution than the TSDF, fine enough for robot collision spheres but
-    # cheap enough to recompute after each depth update. At query time, cuRobo
-    # uses trilinear interpolation over this grid for O(1) distance lookups.
-    print("\nComputing ESDF...")
-    voxel_grid = mapper.compute_esdf()
-    if voxel_grid.feature_tensor is not None:
-        print(
-            f"  ESDF shape: {voxel_grid.feature_tensor.shape}, "
-            f"voxel_size: {voxel_grid.voxel_size:.4f}m"
-        )
-
-    # Extract and save mesh
-    print("\nExtracting mesh...")
-    mesh = mapper.extract_mesh(surface_only=False)
-    if mesh.vertices is not None and len(mesh.vertices) > 0:
-        print(f"Saving mesh to {args.output}")
-        mesh.save_as_mesh(args.output)
-        print(f"Saved mesh: {args.output} ({len(mesh.vertices):,} vertices)")
-
-    else:
-        print("No mesh extracted (empty reconstruction)")
 
     # Keep viser running with interactive ESDF slice
     if visualizer:

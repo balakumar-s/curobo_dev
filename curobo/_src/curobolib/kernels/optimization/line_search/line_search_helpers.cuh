@@ -138,8 +138,8 @@ namespace line_search{
           ScalarType* exploration_cost,
           ScalarType* selected_cost,
           ScalarType* best_cost,
-          int16_t* best_iteration,
-          int16_t* current_iteration,
+          int32_t* best_iteration,
+          int32_t* current_iteration,
           uint8_t* converged_global,
           bool& update_best_shared,
           bool& converged_shared)

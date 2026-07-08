@@ -451,19 +451,19 @@ def make_hash_kernels(
 
     @warp_kernel(f"clear_new_block_features_kernel_{suffix}")
     def clear_new_block_features_kernel(
-        block_features: wp.array2d(dtype=wp.float16),
-        block_feature_weight: wp.array(dtype=wp.float16),
+        block_features: wp.array3d(dtype=wp.float16),
+        block_feature_weight: wp.array2d(dtype=wp.float16),
         new_blocks: wp.array(dtype=wp.int32),
         new_block_count: wp.array(dtype=wp.int32),
         max_blocks: wp.int32,
     ):
-        """Zero the per-block feature accumulator for freshly allocated blocks.
+        """Zero the per-block feature-grid accumulator for freshly allocated blocks.
 
-        Launch with ``dim = (max_clearable, feature_dim)`` so one thread
-        clears one ``(block, channel)`` cell; the thread with
-        ``ch == 0`` also zeroes the per-block feature weight.
+        Launch with ``dim = (max_clearable, feature_nodes, feature_dim)`` so
+        one thread clears one ``(block, node, channel)`` cell; the thread
+        with ``ch == 0`` also zeroes the per-node feature weight.
         """
-        slot_idx, ch = wp.tid()
+        slot_idx, node_idx, ch = wp.tid()
 
         count = new_block_count[0]
         if count > max_blocks:
@@ -472,9 +472,9 @@ def make_hash_kernels(
             return
 
         pool_idx = new_blocks[slot_idx]
-        block_features[pool_idx, ch] = wp.float16(0.0)
+        block_features[pool_idx, node_idx, ch] = wp.float16(0.0)
         if ch == wp.int32(0):
-            block_feature_weight[pool_idx] = wp.float16(0.0)
+            block_feature_weight[pool_idx, node_idx] = wp.float16(0.0)
 
     # Register all closures on the instance for external access.
     return {

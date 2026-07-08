@@ -254,7 +254,7 @@ class LidarProjectIntegrator:
             self._timer_start()
             wp.launch(
                 kernels.clear_new_block_features_kernel,
-                dim=(max_clearable, tsdf.data.feature_dim),
+                dim=(max_clearable, kernels.feature_grid_voxels, tsdf.data.feature_dim),
                 inputs=[
                     data.block_features,
                     data.block_feature_weight,
@@ -335,6 +335,25 @@ class LidarProjectIntegrator:
                 f"rgb_images shape mismatch: expected {expected_rgb_shape}, "
                 f"got {tuple(rgb_images.shape)}."
             )
+        feature_dim_cfg = tsdf.data.feature_dim if tsdf.data.has_features else 0
+        if feature_grid is not None and not tsdf.data.has_features:
+            log_and_raise(
+                "feature_grid was provided but feature_dim == 0; enable features via "
+                "MapperCfg.feature_dim or BlockSparseTSDFIntegratorCfg.feature_dim."
+            )
+        integrate_features = tsdf.data.has_features and feature_grid is not None
+        if integrate_features:
+            expected_feature_shape = (
+                self.lidar_num_sensors,
+                self.lidar_feature_grid_shape[0],
+                self.lidar_feature_grid_shape[1],
+                feature_dim_cfg,
+            )
+            if tuple(feature_grid.shape) != expected_feature_shape:
+                log_and_raise(
+                    f"feature_grid shape mismatch: expected {expected_feature_shape}, "
+                    f"got {tuple(feature_grid.shape)}."
+                )
 
         data = tsdf.get_warp_data()
         device, stream = get_warp_device_stream(range_images)
@@ -371,7 +390,9 @@ class LidarProjectIntegrator:
                 f"{self.max_visible_blocks_per_lidar_integration}. Increase the config value."
             )
 
-        self._build_support_pixels(tsdf, kernels, data, n_keys, self.frame_epoch, device, stream)
+        self._build_support_pixels(
+            tsdf, kernels, data, n_keys, self.frame_epoch, device, stream
+        )
         self._clear_new_blocks(tsdf, kernels, data, num_visible_blocks, device, stream)
 
         block_voxels = tsdf.block_size**3
@@ -404,42 +425,37 @@ class LidarProjectIntegrator:
         )
         self._timer_start()
         wp.launch(
-            kernels.lidar_integrate_block_grid_rgb_from_support_kernel,
+            kernels.lidar_integrate_block_grid_rgb_kernel,
             dim=(num_visible_blocks, self.lidar_num_sensors, kernels.color_grid_voxels),
             inputs=[
                 wp.from_torch(self.pool_indices),
                 num_visible_blocks,
+                wp.from_torch(lidar_positions, dtype=wp.float32),
+                wp.from_torch(lidar_quaternions, dtype=wp.float32),
+                wp.from_torch(range_images, dtype=wp.float32),
+                wp.from_torch(rgb_flat, dtype=wp.vec3ub),
                 wp.from_torch(self.support_counts),
                 wp.from_torch(self.support_pixels),
-                wp.from_torch(rgb_flat, dtype=wp.uint8),
+                wp.from_torch(valid_range_m, dtype=wp.float32),
+                wp.from_torch(elevation_range_rad, dtype=wp.float32),
+                data.block_coords,
                 data.block_grid_rgb,
             ],
             device=device,
             stream=stream,
         )
-        self._timer_stop("lidar_integrate_block_grid_rgb_from_support_kernel")
+        self._timer_stop("lidar_integrate_block_grid_rgb_kernel")
 
-        feature_dim_cfg = tsdf.data.feature_dim if tsdf.data.has_features else 0
-        if feature_grid is not None and not tsdf.data.has_features:
-            log_and_raise(
-                "feature_grid was provided but feature_dim == 0; enable features via "
-                "MapperCfg.feature_dim or BlockSparseTSDFIntegratorCfg.feature_dim."
-            )
-        if tsdf.data.has_features and feature_grid is not None:
-            expected_feature_shape = (
-                self.lidar_num_sensors,
-                self.lidar_feature_grid_shape[0],
-                self.lidar_feature_grid_shape[1],
-                feature_dim_cfg,
-            )
-            if tuple(feature_grid.shape) != expected_feature_shape:
-                log_and_raise(
-                    f"feature_grid shape mismatch: expected {expected_feature_shape}, "
-                    f"got {tuple(feature_grid.shape)}."
-                )
+        if integrate_features:
             feature_inputs = [
                 wp.from_torch(self.pool_indices),
                 num_visible_blocks,
+                wp.from_torch(lidar_positions, dtype=wp.float32),
+                wp.from_torch(lidar_quaternions, dtype=wp.float32),
+                wp.from_torch(range_images, dtype=wp.float32),
+                wp.from_torch(valid_range_m, dtype=wp.float32),
+                wp.from_torch(elevation_range_rad, dtype=wp.float32),
+                data.block_coords,
                 wp.from_torch(self.support_counts),
                 wp.from_torch(self.support_pixels),
                 wp.from_torch(feature_grid, dtype=wp.float16),
@@ -457,7 +473,11 @@ class LidarProjectIntegrator:
                 ) // feature_tile_channels
                 wp.launch_tiled(
                     kernels.lidar_integrate_features_from_support_tiled_kernel,
-                    dim=(num_visible_blocks, self.lidar_num_sensors, feature_channel_tiles),
+                    dim=(
+                        num_visible_blocks,
+                        self.lidar_num_sensors,
+                        kernels.feature_grid_voxels * feature_channel_tiles,
+                    ),
                     block_dim=64,
                     inputs=feature_inputs,
                     device=device,
@@ -467,7 +487,11 @@ class LidarProjectIntegrator:
             else:
                 wp.launch(
                     kernels.lidar_integrate_features_from_support_grouped_kernel,
-                    dim=(num_visible_blocks, self.lidar_num_sensors, feature_channel_groups),
+                    dim=(
+                        num_visible_blocks,
+                        self.lidar_num_sensors,
+                        kernels.feature_grid_voxels * feature_channel_groups,
+                    ),
                     inputs=feature_inputs,
                     device=device,
                     stream=stream,
@@ -479,7 +503,7 @@ class LidarProjectIntegrator:
             self._timer_start()
             wp.launch(
                 kernels.rescale_block_accumulators_kernel,
-                dim=(num_visible_blocks, kernels.feature_dim),
+                dim=(num_visible_blocks, kernels.feature_grid_voxels, kernels.feature_dim),
                 inputs=[
                     wp.from_torch(self.pool_indices),
                     num_visible_blocks,

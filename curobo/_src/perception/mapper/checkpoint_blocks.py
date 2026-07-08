@@ -25,12 +25,13 @@ from curobo._src.perception.mapper.constants import (
     PY_HASH_PRIME_Z,
     PY_POSITIVE_MASK,
     _validate_color_grid_size,
+    _validate_feature_block_grid_size,
 )
 from curobo.logging import log_and_raise
 
 
 BLOCK_CHECKPOINT_FORMAT = "curobo.mapper_blocks"
-BLOCK_CHECKPOINT_SCHEMA_VERSION = 0.9
+BLOCK_CHECKPOINT_SCHEMA_VERSION = 1.0
 
 BLOCK_CHECKPOINT_KEYS = {
     "format",
@@ -47,6 +48,7 @@ BLOCK_METADATA_KEYS = {
     "has_dynamic",
     "has_static",
     "feature_dim",
+    "feature_block_grid_size",
     "color_grid_size",
 }
 
@@ -65,6 +67,7 @@ def build_block_metadata(tsdf) -> Dict[str, Any]:
         "has_dynamic": bool(data.has_dynamic),
         "has_static": bool(data.has_static),
         "feature_dim": int(data.feature_dim),
+        "feature_block_grid_size": int(data.feature_block_grid_size),
         "color_grid_size": int(data.color_grid_size),
     }
 
@@ -166,8 +169,13 @@ def validate_block_metadata(block_metadata: Any) -> None:
     require_positive_float(block_metadata, "truncation_distance")
     require_positive_int(block_metadata, "block_size")
     require_positive_int(block_metadata, "color_grid_size")
+    require_positive_int(block_metadata, "feature_block_grid_size")
     _validate_color_grid_size(
         int(block_metadata["color_grid_size"]),
+        int(block_metadata["block_size"]),
+    )
+    _validate_feature_block_grid_size(
+        int(block_metadata["feature_block_grid_size"]),
         int(block_metadata["block_size"]),
     )
     require_nonnegative_int(block_metadata, "feature_dim")
@@ -200,6 +208,8 @@ def validate_block_payload(
     block_voxels = block_size**3
     color_grid_size = int(block_metadata["color_grid_size"])
     color_grid_voxels = color_grid_size**3
+    feature_block_grid_size = int(block_metadata["feature_block_grid_size"])
+    feature_grid_voxels = feature_block_grid_size**3
     has_dynamic = bool(block_metadata["has_dynamic"])
     has_static = bool(block_metadata["has_static"])
     feature_dim = int(block_metadata["feature_dim"])
@@ -227,11 +237,19 @@ def validate_block_payload(
 
     if feature_dim > 0:
         block_features = require_tensor(blocks, "block_features", torch.float16)
-        require_shape(block_features, "block_features", (n_blocks, feature_dim))
+        require_shape(
+            block_features,
+            "block_features",
+            (n_blocks, feature_grid_voxels, feature_dim),
+        )
         block_feature_weight = require_tensor(
             blocks, "block_feature_weight", torch.float16
         )
-        require_shape(block_feature_weight, "block_feature_weight", (n_blocks,))
+        require_shape(
+            block_feature_weight,
+            "block_feature_weight",
+            (n_blocks, feature_grid_voxels),
+        )
 
     if has_static:
         static_block_data = require_tensor(blocks, "static_block_data", torch.float16)
@@ -280,6 +298,14 @@ def validate_block_metadata_for_target(
             "color_grid_size mismatch: "
             f"checkpoint={block_metadata['color_grid_size']}, "
             f"target={data.color_grid_size}."
+        )
+    if int(block_metadata["feature_block_grid_size"]) != int(
+        data.feature_block_grid_size
+    ):
+        log_and_raise(
+            "feature_block_grid_size mismatch: "
+            f"checkpoint={block_metadata['feature_block_grid_size']}, "
+            f"target={data.feature_block_grid_size}."
         )
 
     source_center = [float(x) for x in block_metadata["grid_center"]]

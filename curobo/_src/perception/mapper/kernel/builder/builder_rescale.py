@@ -35,42 +35,48 @@ def make_rescale_kernels(
     *,
     feature_dim: int,
     color_grid_size: int = 1,
+    feature_block_grid_size: int = 1,
 ) -> dict[str, object]:
     """Build per-block accumulator rescale kernels."""
     FEATURE_DIM = wp.constant(wp.int32(feature_dim))
+    feature_grid_voxels = int(feature_block_grid_size) ** 3
+    FEATURE_GRID_VOXELS = wp.constant(wp.int32(feature_grid_voxels))
     color_grid_voxels = int(color_grid_size) ** 3
     COLOR_GRID_VOXELS = wp.constant(wp.int32(color_grid_voxels))
     COLOR_GRID_RGB_CELLS = wp.constant(wp.int32(color_grid_voxels * 3))
 
-    @warp_kernel(f"rescale_block_accumulators_kernel_bs{block_size}_fd{feature_dim}")
+    @warp_kernel(
+        f"rescale_block_accumulators_kernel_bs{block_size}_fd{feature_dim}"
+        f"_fgs{feature_block_grid_size}"
+    )
     def rescale_block_accumulators_kernel(
         visible_pool_indices: wp.array(dtype=wp.int32),
         n_visible: wp.int32,
         w_max: wp.float32,
-        block_features: wp.array2d(dtype=wp.float16),
-        block_feature_weight: wp.array(dtype=wp.float16),
+        block_features: wp.array3d(dtype=wp.float16),
+        block_feature_weight: wp.array2d(dtype=wp.float16),
     ):
-        """Cap per-block feature weights at ``w_max``; scale sums proportionally.
+        """Cap per-node feature weights at ``w_max``; scale sums proportionally.
 
-        Launch with ``dim = (n_visible, feature_dim)`` — one thread per
-        ``(visible_block, feature_channel)`` pair.
+        Launch with ``dim = (n_visible, feature_grid_voxels, feature_dim)`` — one
+        thread per ``(visible_block, feature_node, feature_channel)`` tuple.
         """
-        vis_idx, ch = wp.tid()
+        vis_idx, node_idx, ch = wp.tid()
 
-        if vis_idx >= n_visible:
+        if vis_idx >= n_visible or node_idx >= FEATURE_GRID_VOXELS:
             return
 
         pool_idx = visible_pool_indices[vis_idx]
         if pool_idx < 0:
             return
         if FEATURE_DIM > 0 and ch < FEATURE_DIM:
-            w_f = wp.float32(block_feature_weight[pool_idx])
+            w_f = wp.float32(block_feature_weight[pool_idx, node_idx])
             if w_f > w_max:
                 s_f = w_max / w_f
-                v_f = wp.float32(block_features[pool_idx, ch]) * s_f
-                block_features[pool_idx, ch] = wp.float16(v_f)
+                v_f = wp.float32(block_features[pool_idx, node_idx, ch]) * s_f
+                block_features[pool_idx, node_idx, ch] = wp.float16(v_f)
                 if ch == 0:
-                    block_feature_weight[pool_idx] = wp.float16(w_max)
+                    block_feature_weight[pool_idx, node_idx] = wp.float16(w_max)
 
     @warp_kernel(
         f"rescale_block_grid_rgb_kernel_bs{block_size}_gs{color_grid_size}"

@@ -96,8 +96,8 @@
      <<< blocksPerGrid, threadsPerBlock, 0, stream >>> (
        best_cost.data_ptr<float>(),
        best_action.data_ptr<float>(),
-       best_iteration.data_ptr<int16_t>(),
-       current_iteration.data_ptr<int16_t>(),
+       best_iteration.data_ptr<int32_t>(),
+       current_iteration.data_ptr<int32_t>(),
        converged_global.data_ptr<uint8_t>(),
        convergence_iteration,
        cost_delta_threshold,

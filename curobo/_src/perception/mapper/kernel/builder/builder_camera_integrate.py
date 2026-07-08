@@ -38,6 +38,7 @@ def make_camera_integrate_kernels(
     max_feature_tile_channels: int,
     max_support_pixels_per_block_camera: int,
     color_grid_size: int,
+    feature_block_grid_size: int,
     pack_key_only,
     unpack_block_key,
     find_or_insert_block,
@@ -71,6 +72,9 @@ def make_camera_integrate_kernels(
     color_grid_voxels = int(color_grid_size) ** 3
     COLOR_GRID_VOXELS = wp.constant(wp.int32(color_grid_voxels))
     COLOR_GRID_CELLS = wp.constant(wp.int32(color_grid_voxels * 4))
+    feature_grid_voxels = int(feature_block_grid_size) ** 3
+    FEATURE_BLOCK_GRID_SIZE = wp.constant(wp.int32(feature_block_grid_size))
+    FEATURE_GRID_VOXELS = wp.constant(wp.int32(feature_grid_voxels))
     if feature_grid_shape is None:
         feature_grid_height = 1
         feature_grid_width = 1
@@ -79,10 +83,25 @@ def make_camera_integrate_kernels(
         feature_grid_width = int(feature_grid_shape[1])
     FEATURE_GRID_HEIGHT = wp.constant(wp.int32(feature_grid_height))
     FEATURE_GRID_WIDTH = wp.constant(wp.int32(feature_grid_width))
-    suffix = (
-        f"bs{block_size}_cfg"
-        f"{warp_constant_suffix(block_size, feature_dim, num_cameras, image_height, image_width, num_samples, grid_shape, origin_xyz, voxel_size, truncation_distance, feature_grid_shape, feature_channels_per_thread, max_feature_tile_channels, max_support_pixels_per_block_camera, color_grid_size)}"
+    suffix_hash = warp_constant_suffix(
+        block_size,
+        feature_dim,
+        num_cameras,
+        image_height,
+        image_width,
+        num_samples,
+        grid_shape,
+        origin_xyz,
+        voxel_size,
+        truncation_distance,
+        feature_grid_shape,
+        feature_channels_per_thread,
+        max_feature_tile_channels,
+        max_support_pixels_per_block_camera,
+        color_grid_size,
+        feature_block_grid_size,
     )
+    suffix = f"bs{block_size}_cfg{suffix_hash}"
 
     # Cross-domain helpers are explicit parameters so Warp sees them as
     # local closure bindings when compiling dependent kernels.
@@ -422,31 +441,31 @@ def make_camera_integrate_kernels(
     def clear_block_features_by_pool_kernel(
         clear_pool_indices: wp.array(dtype=wp.int32),
         clear_count: wp.array(dtype=wp.int32),
-        block_features: wp.array2d(dtype=wp.float16),
-        block_feature_weight: wp.array(dtype=wp.float16),
+        block_features: wp.array3d(dtype=wp.float16),
+        block_feature_weight: wp.array2d(dtype=wp.float16),
         max_blocks: wp.int32,
     ):
-        """Zero feature accumulators for already allocated blocks.
+        """Zero feature-grid accumulators for already allocated blocks.
 
-        Launch with ``dim = (n_clear, feature_dim)`` so one thread
-        clears one ``(block, channel)`` cell; the thread with
-        ``ch == 0`` also zeroes the per-block feature weight.
+        Launch with ``dim = (n_clear, feature_grid_voxels, feature_dim)`` so
+        one thread clears one ``(block, node, channel)`` cell; the thread
+        with ``ch == 0`` also zeroes the per-node feature weight.
         """
-        slot_idx, ch = wp.tid()
+        slot_idx, node_idx, ch = wp.tid()
 
         count = clear_count[0]
         if count > max_blocks:
             count = max_blocks
-        if slot_idx >= count:
+        if slot_idx >= count or node_idx >= FEATURE_GRID_VOXELS:
             return
 
         pool_idx = clear_pool_indices[slot_idx]
         if pool_idx < wp.int32(0) or pool_idx >= max_blocks:
             return
 
-        block_features[pool_idx, ch] = wp.float16(0.0)
+        block_features[pool_idx, node_idx, ch] = wp.float16(0.0)
         if ch == wp.int32(0):
-            block_feature_weight[pool_idx] = wp.float16(0.0)
+            block_feature_weight[pool_idx, node_idx] = wp.float16(0.0)
 
     @warp_kernel(f"integrate_voxels_kernel_{suffix}")
     def integrate_voxels_kernel(
@@ -546,6 +565,8 @@ def make_camera_integrate_kernels(
         cam_quaternions: wp.array2d(dtype=wp.float32),
         depth_images: wp.array3d(dtype=wp.float32),
         rgb_images_flat: wp.array2d(dtype=wp.vec3ub),
+        support_counts: wp.array2d(dtype=wp.int32),
+        support_pixels: wp.array3d(dtype=wp.int32),
         depth_min: float,
         depth_max: float,
         block_coords: wp.array(dtype=wp.int32),
@@ -774,15 +795,45 @@ def make_camera_integrate_kernels(
                             )
                             total_w = total_w + weight11
 
+        old_r = wp.float32(block_grid_rgb[pool_idx, node_idx, 0])
+        old_g = wp.float32(block_grid_rgb[pool_idx, node_idx, 1])
+        old_b = wp.float32(block_grid_rgb[pool_idx, node_idx, 2])
+        old_w = wp.float32(block_grid_rgb[pool_idx, node_idx, 3])
         if total_w > wp.float32(0.0):
-            old_r = wp.float32(block_grid_rgb[pool_idx, node_idx, 0])
-            old_g = wp.float32(block_grid_rgb[pool_idx, node_idx, 1])
-            old_b = wp.float32(block_grid_rgb[pool_idx, node_idx, 2])
-            old_w = wp.float32(block_grid_rgb[pool_idx, node_idx, 3])
             block_grid_rgb[pool_idx, node_idx, 0] = wp.float16(old_r + total_r)
             block_grid_rgb[pool_idx, node_idx, 1] = wp.float16(old_g + total_g)
             block_grid_rgb[pool_idx, node_idx, 2] = wp.float16(old_b + total_b)
             block_grid_rgb[pool_idx, node_idx, 3] = wp.float16(old_w + total_w)
+            return
+
+        support_r = wp.float32(0.0)
+        support_g = wp.float32(0.0)
+        support_b = wp.float32(0.0)
+        support_w = wp.float32(0.0)
+        for cam_i in range(num_cameras):
+            count = support_counts[vis_idx, cam_i]
+            if count > wp.int32(0):
+                pixel_idx = support_pixels[vis_idx, cam_i, 0]
+                py = pixel_idx // IMAGE_WIDTH
+                px = pixel_idx - py * IMAGE_WIDTH
+                if (
+                    py >= wp.int32(0)
+                    and py < IMAGE_HEIGHT
+                    and px >= wp.int32(0)
+                    and px < IMAGE_WIDTH
+                ):
+                    row = cam_i * IMAGE_HEIGHT + py
+                    rgb = rgb_images_flat[row, px]
+                    support_r = support_r + wp.float32(rgb[0]) * inv_255
+                    support_g = support_g + wp.float32(rgb[1]) * inv_255
+                    support_b = support_b + wp.float32(rgb[2]) * inv_255
+                    support_w = support_w + wp.float32(1.0)
+
+        if support_w > wp.float32(0.0):
+            block_grid_rgb[pool_idx, node_idx, 0] = wp.float16(old_r + support_r)
+            block_grid_rgb[pool_idx, node_idx, 1] = wp.float16(old_g + support_g)
+            block_grid_rgb[pool_idx, node_idx, 2] = wp.float16(old_b + support_b)
+            block_grid_rgb[pool_idx, node_idx, 3] = wp.float16(old_w + support_w)
 
     @warp_kernel(
         f"integrate_features_from_support_grouped_kernel_{suffix}_fcpt"
@@ -791,69 +842,173 @@ def make_camera_integrate_kernels(
     def integrate_features_from_support_grouped_kernel(
         visible_pool_indices: wp.array(dtype=wp.int32),
         n_visible: wp.int32,
+        intrinsics: wp.array3d(dtype=wp.float32),
+        cam_positions: wp.array2d(dtype=wp.float32),
+        cam_quaternions: wp.array2d(dtype=wp.float32),
+        depth_images: wp.array3d(dtype=wp.float32),
         support_counts: wp.array2d(dtype=wp.int32),
         support_pixels: wp.array3d(dtype=wp.int32),
         feature_grid: wp.array4d(dtype=wp.float16),
-        block_features: wp.array2d(dtype=wp.float16),
-        block_feature_weight: wp.array(dtype=wp.float16),
+        depth_min: float,
+        depth_max: float,
+        block_coords: wp.array(dtype=wp.int32),
+        block_features: wp.array3d(dtype=wp.float16),
+        block_feature_weight: wp.array2d(dtype=wp.float16),
     ):
-        """Per-block feature aggregation from allocation-time support pixels."""
+        """Per-node feature-grid integration with support fallback for empty nodes."""
         n_channel_groups = (
             FEATURE_DIM + FEATURE_CHANNELS_PER_THREAD - wp.int32(1)
         ) // FEATURE_CHANNELS_PER_THREAD
-        vis_idx, cam_i, feature_channel_group_idx = wp.tid()
+        vis_idx, node_idx, feature_channel_group_idx = wp.tid()
 
-        if vis_idx >= n_visible or feature_channel_group_idx >= n_channel_groups:
+        if (
+            vis_idx >= n_visible
+            or node_idx >= FEATURE_GRID_VOXELS
+            or feature_channel_group_idx >= n_channel_groups
+        ):
             return
 
         pool_idx = visible_pool_indices[vis_idx]
         if pool_idx < wp.int32(0):
             return
 
-        count = support_counts[vis_idx, cam_i]
-        if count > SUPPORT_CAPACITY:
-            count = SUPPORT_CAPACITY
-        if count <= wp.int32(0):
-            return
+        bx = block_coords[pool_idx * 3 + 0]
+        by = block_coords[pool_idx * 3 + 1]
+        bz = block_coords[pool_idx * 3 + 2]
+
+        gx_node = node_idx % FEATURE_BLOCK_GRID_SIZE
+        gy_node = (node_idx // FEATURE_BLOCK_GRID_SIZE) % FEATURE_BLOCK_GRID_SIZE
+        gz_node = node_idx // (FEATURE_BLOCK_GRID_SIZE * FEATURE_BLOCK_GRID_SIZE)
+
+        local_x = wp.float32(0.0)
+        local_y = wp.float32(0.0)
+        local_z = wp.float32(0.0)
+        if FEATURE_BLOCK_GRID_SIZE > wp.int32(1):
+            span = wp.float32(BLOCK_SIZE - wp.int32(1))
+            denom = wp.float32(FEATURE_BLOCK_GRID_SIZE - wp.int32(1))
+            local_x = wp.float32(0.5) + wp.float32(gx_node) * span / denom
+            local_y = wp.float32(0.5) + wp.float32(gy_node) * span / denom
+            local_z = wp.float32(0.5) + wp.float32(gz_node) * span / denom
+        else:
+            center = wp.float32(BLOCK_SIZE) * wp.float32(0.5)
+            local_x = center
+            local_y = center
+            local_z = center
+
+        base = block_key_to_voxel_base(bx, by, bz)
+        center_offset_x = wp.float32(GRID_W) * wp.float32(0.5)
+        center_offset_y = wp.float32(GRID_H) * wp.float32(0.5)
+        center_offset_z = wp.float32(GRID_D) * wp.float32(0.5)
+        node_world = (
+            wp.vec3(ORIGIN_X, ORIGIN_Y, ORIGIN_Z)
+            + wp.vec3(
+                wp.float32(base[0]) + local_x - center_offset_x,
+                wp.float32(base[1]) + local_y - center_offset_y,
+                wp.float32(base[2]) + local_z - center_offset_z,
+            )
+            * VOXEL_SIZE
+        )
 
         base_feature_channel = feature_channel_group_idx * FEATURE_CHANNELS_PER_THREAD
         feature_acc = wp.zeros(FEATURE_CHANNELS_PER_THREAD, dtype=wp.float32)
+        total_w = wp.float32(0.0)
 
-        for k in range(support_capacity):
-            if k < count:
-                pixel_idx = support_pixels[vis_idx, cam_i, k]
-                py = pixel_idx // IMAGE_WIDTH
-                px = pixel_idx - py * IMAGE_WIDTH
-                if (
-                    py >= wp.int32(0)
-                    and py < IMAGE_HEIGHT
-                    and px >= wp.int32(0)
-                    and px < IMAGE_WIDTH
-                ):
-                    gy = (py * FEATURE_GRID_HEIGHT) // IMAGE_HEIGHT
-                    gx = (px * FEATURE_GRID_WIDTH) // IMAGE_WIDTH
-                    if gy < wp.int32(0):
-                        gy = wp.int32(0)
-                    if gx < wp.int32(0):
-                        gx = wp.int32(0)
-                    if gy >= FEATURE_GRID_HEIGHT:
-                        gy = FEATURE_GRID_HEIGHT - wp.int32(1)
-                    if gx >= FEATURE_GRID_WIDTH:
-                        gx = FEATURE_GRID_WIDTH - wp.int32(1)
-                    for feature_channel_offset in range(FEATURE_CHANNELS_PER_THREAD):
-                        feature_channel = base_feature_channel + feature_channel_offset
-                        if feature_channel < FEATURE_DIM:
-                            feature_acc[feature_channel_offset] = (
-                                feature_acc[feature_channel_offset]
-                                + wp.float32(
-                                    feature_grid[
-                                        cam_i,
-                                        gy,
-                                        gx,
-                                        feature_channel,
-                                    ]
+        for cam_i in range(num_cameras):
+            cam_pos = wp.vec3(
+                cam_positions[cam_i, 0],
+                cam_positions[cam_i, 1],
+                cam_positions[cam_i, 2],
+            )
+            cam_quat = wp.quaternion(
+                cam_quaternions[cam_i, 1],
+                cam_quaternions[cam_i, 2],
+                cam_quaternions[cam_i, 3],
+                cam_quaternions[cam_i, 0],
+            )
+            node_cam = wp.quat_rotate(wp.quat_inverse(cam_quat), node_world - cam_pos)
+            z_cam = node_cam[2]
+            if z_cam > depth_min and z_cam <= depth_max:
+                fx = intrinsics[cam_i, 0, 0]
+                fy = intrinsics[cam_i, 1, 1]
+                cx_i = intrinsics[cam_i, 0, 2]
+                cy_i = intrinsics[cam_i, 1, 2]
+                u = fx * node_cam[0] / z_cam + cx_i
+                v = fy * node_cam[1] / z_cam + cy_i
+                px = wp.int32(wp.floor(u + wp.float32(0.5)))
+                py = wp.int32(wp.floor(v + wp.float32(0.5)))
+                if px >= 0 and px < IMAGE_WIDTH and py >= 0 and py < IMAGE_HEIGHT:
+                    depth = depth_images[cam_i, py, px]
+                    sdf = depth - z_cam
+                    if depth >= depth_min and depth <= depth_max and sdf >= -TRUNCATION_DIST and sdf <= TRUNCATION_DIST:
+                        weight = compute_tsdf_weight(depth, VOXEL_SIZE)
+                        gy = (py * FEATURE_GRID_HEIGHT) // IMAGE_HEIGHT
+                        gx = (px * FEATURE_GRID_WIDTH) // IMAGE_WIDTH
+                        if gy < wp.int32(0):
+                            gy = wp.int32(0)
+                        if gx < wp.int32(0):
+                            gx = wp.int32(0)
+                        if gy >= FEATURE_GRID_HEIGHT:
+                            gy = FEATURE_GRID_HEIGHT - wp.int32(1)
+                        if gx >= FEATURE_GRID_WIDTH:
+                            gx = FEATURE_GRID_WIDTH - wp.int32(1)
+                        for feature_channel_offset in range(FEATURE_CHANNELS_PER_THREAD):
+                            feature_channel = base_feature_channel + feature_channel_offset
+                            if feature_channel < FEATURE_DIM:
+                                feature_acc[feature_channel_offset] = (
+                                    feature_acc[feature_channel_offset]
+                                    + wp.float32(
+                                        feature_grid[
+                                            cam_i,
+                                            gy,
+                                            gx,
+                                            feature_channel,
+                                        ]
+                                    )
+                                    * weight
                                 )
-                            )
+                        total_w = total_w + weight
+
+        if total_w <= wp.float32(0.0):
+            for cam_i in range(num_cameras):
+                count = support_counts[vis_idx, cam_i]
+                if count > wp.int32(0):
+                    pixel_idx = support_pixels[vis_idx, cam_i, 0]
+                    py = pixel_idx // IMAGE_WIDTH
+                    px = pixel_idx - py * IMAGE_WIDTH
+                    if (
+                        py >= wp.int32(0)
+                        and py < IMAGE_HEIGHT
+                        and px >= wp.int32(0)
+                        and px < IMAGE_WIDTH
+                    ):
+                        gy = (py * FEATURE_GRID_HEIGHT) // IMAGE_HEIGHT
+                        gx = (px * FEATURE_GRID_WIDTH) // IMAGE_WIDTH
+                        if gy < wp.int32(0):
+                            gy = wp.int32(0)
+                        if gx < wp.int32(0):
+                            gx = wp.int32(0)
+                        if gy >= FEATURE_GRID_HEIGHT:
+                            gy = FEATURE_GRID_HEIGHT - wp.int32(1)
+                        if gx >= FEATURE_GRID_WIDTH:
+                            gx = FEATURE_GRID_WIDTH - wp.int32(1)
+                        for feature_channel_offset in range(FEATURE_CHANNELS_PER_THREAD):
+                            feature_channel = base_feature_channel + feature_channel_offset
+                            if feature_channel < FEATURE_DIM:
+                                feature_acc[feature_channel_offset] = (
+                                    feature_acc[feature_channel_offset]
+                                    + wp.float32(
+                                        feature_grid[
+                                            cam_i,
+                                            gy,
+                                            gx,
+                                            feature_channel,
+                                        ]
+                                    )
+                                )
+                        total_w = total_w + wp.float32(1.0)
+
+        if total_w <= wp.float32(0.0):
+            return
 
         for feature_channel_offset in range(FEATURE_CHANNELS_PER_THREAD):
             feature_channel = base_feature_channel + feature_channel_offset
@@ -861,11 +1016,12 @@ def make_camera_integrate_kernels(
                 wp.atomic_add(
                     block_features,
                     pool_idx,
+                    node_idx,
                     feature_channel,
                     wp.float16(feature_acc[feature_channel_offset]),
                 )
         if base_feature_channel == wp.int32(0):
-            wp.atomic_add(block_feature_weight, pool_idx, wp.float16(wp.float32(count)))
+            wp.atomic_add(block_feature_weight, pool_idx, node_idx, wp.float16(total_w))
 
     @warp_kernel(
         f"integrate_features_from_support_tiled_kernel_{suffix}_tile"
@@ -874,76 +1030,174 @@ def make_camera_integrate_kernels(
     def integrate_features_from_support_tiled_kernel(
         visible_pool_indices: wp.array(dtype=wp.int32),
         n_visible: wp.int32,
+        intrinsics: wp.array3d(dtype=wp.float32),
+        cam_positions: wp.array2d(dtype=wp.float32),
+        cam_quaternions: wp.array2d(dtype=wp.float32),
+        depth_images: wp.array3d(dtype=wp.float32),
         support_counts: wp.array2d(dtype=wp.int32),
         support_pixels: wp.array3d(dtype=wp.int32),
         feature_grid: wp.array4d(dtype=wp.float16),
-        block_features: wp.array2d(dtype=wp.float16),
-        block_feature_weight: wp.array(dtype=wp.float16),
+        depth_min: float,
+        depth_max: float,
+        block_coords: wp.array(dtype=wp.int32),
+        block_features: wp.array3d(dtype=wp.float16),
+        block_feature_weight: wp.array2d(dtype=wp.float16),
     ):
-        """Tile prototype: one CTA accumulates a feature-channel slice."""
+        """Tiled per-node feature-grid integration."""
         n_channel_tiles = (
             FEATURE_DIM + FEATURE_TILE_CHANNELS - wp.int32(1)
         ) // FEATURE_TILE_CHANNELS
-        vis_idx, cam_i, feature_tile_idx, lane = wp.tid()
+        vis_idx, node_idx, feature_tile_idx, lane = wp.tid()
 
-        if vis_idx >= n_visible or feature_tile_idx >= n_channel_tiles:
+        if (
+            vis_idx >= n_visible
+            or node_idx >= FEATURE_GRID_VOXELS
+            or feature_tile_idx >= n_channel_tiles
+        ):
             return
 
         pool_idx = visible_pool_indices[vis_idx]
         if pool_idx < wp.int32(0):
             return
 
-        count = support_counts[vis_idx, cam_i]
-        if count > SUPPORT_CAPACITY:
-            count = SUPPORT_CAPACITY
-        if count <= wp.int32(0):
-            return
+        bx = block_coords[pool_idx * 3 + 0]
+        by = block_coords[pool_idx * 3 + 1]
+        bz = block_coords[pool_idx * 3 + 2]
+
+        gx_node = node_idx % FEATURE_BLOCK_GRID_SIZE
+        gy_node = (node_idx // FEATURE_BLOCK_GRID_SIZE) % FEATURE_BLOCK_GRID_SIZE
+        gz_node = node_idx // (FEATURE_BLOCK_GRID_SIZE * FEATURE_BLOCK_GRID_SIZE)
+
+        local_x = wp.float32(0.0)
+        local_y = wp.float32(0.0)
+        local_z = wp.float32(0.0)
+        if FEATURE_BLOCK_GRID_SIZE > wp.int32(1):
+            span = wp.float32(BLOCK_SIZE - wp.int32(1))
+            denom = wp.float32(FEATURE_BLOCK_GRID_SIZE - wp.int32(1))
+            local_x = wp.float32(0.5) + wp.float32(gx_node) * span / denom
+            local_y = wp.float32(0.5) + wp.float32(gy_node) * span / denom
+            local_z = wp.float32(0.5) + wp.float32(gz_node) * span / denom
+        else:
+            center = wp.float32(BLOCK_SIZE) * wp.float32(0.5)
+            local_x = center
+            local_y = center
+            local_z = center
+
+        base = block_key_to_voxel_base(bx, by, bz)
+        center_offset_x = wp.float32(GRID_W) * wp.float32(0.5)
+        center_offset_y = wp.float32(GRID_H) * wp.float32(0.5)
+        center_offset_z = wp.float32(GRID_D) * wp.float32(0.5)
+        node_world = (
+            wp.vec3(ORIGIN_X, ORIGIN_Y, ORIGIN_Z)
+            + wp.vec3(
+                wp.float32(base[0]) + local_x - center_offset_x,
+                wp.float32(base[1]) + local_y - center_offset_y,
+                wp.float32(base[2]) + local_z - center_offset_z,
+            )
+            * VOXEL_SIZE
+        )
 
         base_feature_channel = feature_tile_idx * FEATURE_TILE_CHANNELS
         feature_acc = wp.tile_zeros(shape=feature_tile_channels, dtype=wp.float32)
+        total_w = wp.float32(0.0)
 
-        for k in range(support_capacity):
-            if k < count:
-                pixel_idx = support_pixels[vis_idx, cam_i, k]
-                py = pixel_idx // IMAGE_WIDTH
-                px = pixel_idx - py * IMAGE_WIDTH
-                if (
-                    py >= wp.int32(0)
-                    and py < IMAGE_HEIGHT
-                    and px >= wp.int32(0)
-                    and px < IMAGE_WIDTH
-                ):
-                    gy = (py * FEATURE_GRID_HEIGHT) // IMAGE_HEIGHT
-                    gx = (px * FEATURE_GRID_WIDTH) // IMAGE_WIDTH
-                    if gy < wp.int32(0):
-                        gy = wp.int32(0)
-                    if gx < wp.int32(0):
-                        gx = wp.int32(0)
-                    if gy >= FEATURE_GRID_HEIGHT:
-                        gy = FEATURE_GRID_HEIGHT - wp.int32(1)
-                    if gx >= FEATURE_GRID_WIDTH:
-                        gx = FEATURE_GRID_WIDTH - wp.int32(1)
+        for cam_i in range(num_cameras):
+            cam_pos = wp.vec3(
+                cam_positions[cam_i, 0],
+                cam_positions[cam_i, 1],
+                cam_positions[cam_i, 2],
+            )
+            cam_quat = wp.quaternion(
+                cam_quaternions[cam_i, 1],
+                cam_quaternions[cam_i, 2],
+                cam_quaternions[cam_i, 3],
+                cam_quaternions[cam_i, 0],
+            )
+            node_cam = wp.quat_rotate(wp.quat_inverse(cam_quat), node_world - cam_pos)
+            z_cam = node_cam[2]
+            if z_cam > depth_min and z_cam <= depth_max:
+                fx = intrinsics[cam_i, 0, 0]
+                fy = intrinsics[cam_i, 1, 1]
+                cx_i = intrinsics[cam_i, 0, 2]
+                cy_i = intrinsics[cam_i, 1, 2]
+                u = fx * node_cam[0] / z_cam + cx_i
+                v = fy * node_cam[1] / z_cam + cy_i
+                px = wp.int32(wp.floor(u + wp.float32(0.5)))
+                py = wp.int32(wp.floor(v + wp.float32(0.5)))
+                if px >= 0 and px < IMAGE_WIDTH and py >= 0 and py < IMAGE_HEIGHT:
+                    depth = depth_images[cam_i, py, px]
+                    sdf = depth - z_cam
+                    if depth >= depth_min and depth <= depth_max and sdf >= -TRUNCATION_DIST and sdf <= TRUNCATION_DIST:
+                        weight = compute_tsdf_weight(depth, VOXEL_SIZE)
+                        gy = (py * FEATURE_GRID_HEIGHT) // IMAGE_HEIGHT
+                        gx = (px * FEATURE_GRID_WIDTH) // IMAGE_WIDTH
+                        if gy < wp.int32(0):
+                            gy = wp.int32(0)
+                        if gx < wp.int32(0):
+                            gx = wp.int32(0)
+                        if gy >= FEATURE_GRID_HEIGHT:
+                            gy = FEATURE_GRID_HEIGHT - wp.int32(1)
+                        if gx >= FEATURE_GRID_WIDTH:
+                            gx = FEATURE_GRID_WIDTH - wp.int32(1)
+                        feature_vals_h = wp.tile_load(
+                            feature_grid[cam_i, gy, gx],
+                            shape=feature_tile_channels,
+                            offset=base_feature_channel,
+                            bounds_check=True,
+                        )
+                        feature_acc = feature_acc + wp.tile_astype(
+                            feature_vals_h,
+                            dtype=wp.float32,
+                        ) * weight
+                        total_w = total_w + weight
 
-                    feature_vals_h = wp.tile_load(
-                        feature_grid[cam_i, gy, gx],
-                        shape=feature_tile_channels,
-                        offset=base_feature_channel,
-                        bounds_check=True,
-                    )
-                    feature_acc = feature_acc + wp.tile_astype(
-                        feature_vals_h,
-                        dtype=wp.float32,
-                    )
+        if total_w <= wp.float32(0.0):
+            for cam_i in range(num_cameras):
+                count = support_counts[vis_idx, cam_i]
+                if count > wp.int32(0):
+                    pixel_idx = support_pixels[vis_idx, cam_i, 0]
+                    py = pixel_idx // IMAGE_WIDTH
+                    px = pixel_idx - py * IMAGE_WIDTH
+                    if (
+                        py >= wp.int32(0)
+                        and py < IMAGE_HEIGHT
+                        and px >= wp.int32(0)
+                        and px < IMAGE_WIDTH
+                    ):
+                        gy = (py * FEATURE_GRID_HEIGHT) // IMAGE_HEIGHT
+                        gx = (px * FEATURE_GRID_WIDTH) // IMAGE_WIDTH
+                        if gy < wp.int32(0):
+                            gy = wp.int32(0)
+                        if gx < wp.int32(0):
+                            gx = wp.int32(0)
+                        if gy >= FEATURE_GRID_HEIGHT:
+                            gy = FEATURE_GRID_HEIGHT - wp.int32(1)
+                        if gx >= FEATURE_GRID_WIDTH:
+                            gx = FEATURE_GRID_WIDTH - wp.int32(1)
+                        feature_vals_h = wp.tile_load(
+                            feature_grid[cam_i, gy, gx],
+                            shape=feature_tile_channels,
+                            offset=base_feature_channel,
+                            bounds_check=True,
+                        )
+                        feature_acc = feature_acc + wp.tile_astype(
+                            feature_vals_h,
+                            dtype=wp.float32,
+                        )
+                        total_w = total_w + wp.float32(1.0)
+
+        if total_w <= wp.float32(0.0):
+            return
 
         feature_acc_h = wp.tile_astype(feature_acc, dtype=wp.float16)
         wp.tile_atomic_add(
-            block_features[pool_idx],
+            block_features[pool_idx, node_idx],
             feature_acc_h,
             offset=base_feature_channel,
             bounds_check=True,
         )
         if feature_tile_idx == wp.int32(0) and lane == wp.int32(0):
-            wp.atomic_add(block_feature_weight, pool_idx, wp.float16(wp.float32(count)))
+            wp.atomic_add(block_feature_weight, pool_idx, node_idx, wp.float16(total_w))
 
     return {
         "compute_block_keys_only_kernel": compute_block_keys_only_kernel,

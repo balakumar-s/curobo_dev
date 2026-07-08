@@ -32,12 +32,14 @@ def make_lidar_integrate_kernels(
     max_feature_tile_channels: int,
     max_support_pixels_per_block_lidar: int,
     color_grid_size: int,
+    feature_block_grid_size: int,
     pack_key_only,
     unpack_block_key,
     hash_lookup,
     world_to_continuous_voxel,
     block_local_to_world,
     block_grid_to_key_coords,
+    block_key_to_voxel_base,
 ) -> dict[str, object]:
     """Build LiDAR range-image integration kernels."""
     BLOCK_SIZE = wp.constant(block_size)
@@ -48,6 +50,9 @@ def make_lidar_integrate_kernels(
     GRID_D = wp.constant(wp.int32(grid_shape[0]))
     GRID_H = wp.constant(wp.int32(grid_shape[1]))
     GRID_W = wp.constant(wp.int32(grid_shape[2]))
+    ORIGIN_X = wp.constant(wp.float32(origin_xyz[0]))
+    ORIGIN_Y = wp.constant(wp.float32(origin_xyz[1]))
+    ORIGIN_Z = wp.constant(wp.float32(origin_xyz[2]))
     VOXEL_SIZE = wp.constant(wp.float32(voxel_size))
     TRUNCATION_DIST = wp.constant(wp.float32(truncation_distance))
     PI = wp.constant(wp.float32(3.141592653589793))
@@ -56,7 +61,11 @@ def make_lidar_integrate_kernels(
     STEP_SIZE = wp.constant(wp.float32(safe_step))
     FEATURE_DIM = wp.constant(wp.int32(feature_dim))
     color_grid_voxels = int(color_grid_size) ** 3
+    COLOR_GRID_SIZE = wp.constant(wp.int32(color_grid_size))
     COLOR_GRID_VOXELS = wp.constant(wp.int32(color_grid_voxels))
+    feature_grid_voxels = int(feature_block_grid_size) ** 3
+    FEATURE_BLOCK_GRID_SIZE = wp.constant(wp.int32(feature_block_grid_size))
+    FEATURE_GRID_VOXELS = wp.constant(wp.int32(feature_grid_voxels))
     if lidar_feature_grid_shape is None:
         lidar_feature_grid_height = 1
         lidar_feature_grid_width = 1
@@ -70,10 +79,25 @@ def make_lidar_integrate_kernels(
     FEATURE_TILE_CHANNELS = wp.constant(feature_tile_channels)
     support_capacity = int(max_support_pixels_per_block_lidar)
     SUPPORT_CAPACITY = wp.constant(support_capacity)
-    suffix = (
-        f"bs{block_size}_cfg"
-        f"{warp_constant_suffix(block_size, feature_dim, lidar_num_sensors, lidar_image_height, lidar_image_width, num_samples, grid_shape, origin_xyz, voxel_size, truncation_distance, lidar_feature_grid_shape, feature_channels_per_thread, max_feature_tile_channels, max_support_pixels_per_block_lidar, color_grid_size)}"
+    suffix_hash = warp_constant_suffix(
+        block_size,
+        feature_dim,
+        lidar_num_sensors,
+        lidar_image_height,
+        lidar_image_width,
+        num_samples,
+        grid_shape,
+        origin_xyz,
+        voxel_size,
+        truncation_distance,
+        lidar_feature_grid_shape,
+        feature_channels_per_thread,
+        max_feature_tile_channels,
+        max_support_pixels_per_block_lidar,
+        color_grid_size,
+        feature_block_grid_size,
     )
+    suffix = f"bs{block_size}_cfg{suffix_hash}"
 
     @wp.func
     def _lidar_pixel_ray(
@@ -113,6 +137,20 @@ def make_lidar_integrate_kernels(
         max_range: wp.float32,
     ) -> bool:
         return value >= min_range and value <= max_range
+
+    @wp.func
+    def _lidar_feature_grid_coords(px: wp.int32, py: wp.int32) -> wp.vec2i:
+        gx = (px * LIDAR_FEATURE_GRID_WIDTH) // LIDAR_IMAGE_WIDTH
+        gy = (py * LIDAR_FEATURE_GRID_HEIGHT) // LIDAR_IMAGE_HEIGHT
+        if gx < wp.int32(0):
+            gx = wp.int32(0)
+        if gy < wp.int32(0):
+            gy = wp.int32(0)
+        if gx >= LIDAR_FEATURE_GRID_WIDTH:
+            gx = LIDAR_FEATURE_GRID_WIDTH - wp.int32(1)
+        if gy >= LIDAR_FEATURE_GRID_HEIGHT:
+            gy = LIDAR_FEATURE_GRID_HEIGHT - wp.int32(1)
+        return wp.vec2i(gx, gy)
 
     @warp_kernel(f"lidar_compute_block_keys_only_kernel_{suffix}")
     def lidar_compute_block_keys_only_kernel(
@@ -469,15 +507,19 @@ def make_lidar_integrate_kernels(
             block_data[pool_idx, local_idx, 0] = wp.float16(old_sw + total_sw)
             block_data[pool_idx, local_idx, 1] = wp.float16(old_w + total_w)
 
-    @warp_kernel(
-        f"lidar_integrate_block_grid_rgb_from_support_kernel_{suffix}_sc{support_capacity}"
-    )
-    def lidar_integrate_block_grid_rgb_from_support_kernel(
+    @warp_kernel(f"lidar_integrate_block_grid_rgb_kernel_{suffix}")
+    def lidar_integrate_block_grid_rgb_kernel(
         visible_pool_indices: wp.array(dtype=wp.int32),
         n_visible: wp.int32,
+        lidar_positions: wp.array2d(dtype=wp.float32),
+        lidar_quaternions: wp.array2d(dtype=wp.float32),
+        range_images: wp.array3d(dtype=wp.float32),
+        rgb_images_flat: wp.array2d(dtype=wp.vec3ub),
         support_counts: wp.array2d(dtype=wp.int32),
         support_pixels: wp.array3d(dtype=wp.int32),
-        rgb_images_flat: wp.array3d(dtype=wp.uint8),
+        valid_range_m: wp.array2d(dtype=wp.float32),
+        elevation_range_rad: wp.array2d(dtype=wp.float32),
+        block_coords: wp.array(dtype=wp.int32),
         block_grid_rgb: wp.array3d(dtype=wp.float16),
     ):
         vis_idx, lidar_i, node_idx = wp.tid()
@@ -487,36 +529,215 @@ def make_lidar_integrate_kernels(
         if pool_idx < wp.int32(0):
             return
 
-        count = support_counts[vis_idx, lidar_i]
-        if count > SUPPORT_CAPACITY:
-            count = SUPPORT_CAPACITY
-        if count <= wp.int32(0):
+        bx = block_coords[pool_idx * 3 + 0]
+        by = block_coords[pool_idx * 3 + 1]
+        bz = block_coords[pool_idx * 3 + 2]
+
+        gx_node = node_idx % COLOR_GRID_SIZE
+        gy_node = (node_idx // COLOR_GRID_SIZE) % COLOR_GRID_SIZE
+        gz_node = node_idx // (COLOR_GRID_SIZE * COLOR_GRID_SIZE)
+
+        local_x = wp.float32(0.0)
+        local_y = wp.float32(0.0)
+        local_z = wp.float32(0.0)
+        if COLOR_GRID_SIZE > wp.int32(1):
+            span = wp.float32(BLOCK_SIZE - wp.int32(1))
+            denom = wp.float32(COLOR_GRID_SIZE - wp.int32(1))
+            local_x = wp.float32(0.5) + wp.float32(gx_node) * span / denom
+            local_y = wp.float32(0.5) + wp.float32(gy_node) * span / denom
+            local_z = wp.float32(0.5) + wp.float32(gz_node) * span / denom
+        else:
+            center = wp.float32(BLOCK_SIZE) * wp.float32(0.5)
+            local_x = center
+            local_y = center
+            local_z = center
+
+        base = block_key_to_voxel_base(bx, by, bz)
+        center_offset_x = wp.float32(GRID_W) * wp.float32(0.5)
+        center_offset_y = wp.float32(GRID_H) * wp.float32(0.5)
+        center_offset_z = wp.float32(GRID_D) * wp.float32(0.5)
+        node_world = (
+            wp.vec3(ORIGIN_X, ORIGIN_Y, ORIGIN_Z)
+            + wp.vec3(
+                wp.float32(base[0]) + local_x - center_offset_x,
+                wp.float32(base[1]) + local_y - center_offset_y,
+                wp.float32(base[2]) + local_z - center_offset_z,
+            )
+            * VOXEL_SIZE
+        )
+
+        lidar_pos = wp.vec3(
+            lidar_positions[lidar_i, 0],
+            lidar_positions[lidar_i, 1],
+            lidar_positions[lidar_i, 2],
+        )
+        lidar_quat = wp.quaternion(
+            lidar_quaternions[lidar_i, 1],
+            lidar_quaternions[lidar_i, 2],
+            lidar_quaternions[lidar_i, 3],
+            lidar_quaternions[lidar_i, 0],
+        )
+        node_lidar = wp.quat_rotate(wp.quat_inverse(lidar_quat), node_world - lidar_pos)
+        node_range = wp.sqrt(wp.dot(node_lidar, node_lidar))
+        inv_255 = wp.float32(1.0 / 255.0)
+
+        min_range = valid_range_m[lidar_i, 0]
+        max_range = valid_range_m[lidar_i, 1]
+        if not _range_valid(node_range, min_range, max_range):
+            count = support_counts[vis_idx, lidar_i]
+            if count > wp.int32(0):
+                pixel_idx = support_pixels[vis_idx, lidar_i, 0]
+                px = pixel_idx % LIDAR_IMAGE_WIDTH
+                py = pixel_idx // LIDAR_IMAGE_WIDTH
+                if py >= wp.int32(0) and py < LIDAR_IMAGE_HEIGHT and px >= wp.int32(0) and px < LIDAR_IMAGE_WIDTH:
+                    row = lidar_i * LIDAR_IMAGE_HEIGHT + py
+                    rgb = rgb_images_flat[row, px]
+                    wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 0, wp.float16(wp.float32(rgb[0]) * inv_255))
+                    wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 1, wp.float16(wp.float32(rgb[1]) * inv_255))
+                    wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 2, wp.float16(wp.float32(rgb[2]) * inv_255))
+                    wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 3, wp.float16(1.0))
             return
 
-        inv_255 = wp.float32(1.0 / 255.0)
+        min_elev = elevation_range_rad[lidar_i, 0]
+        max_elev = elevation_range_rad[lidar_i, 1]
+        xy_norm = wp.sqrt(node_lidar[0] * node_lidar[0] + node_lidar[1] * node_lidar[1])
+        elevation = wp.atan2(node_lidar[2], xy_norm)
+        v_float = wp.float32(0.0)
+        if LIDAR_IMAGE_HEIGHT > wp.int32(1):
+            if elevation < min_elev or elevation > max_elev:
+                count = support_counts[vis_idx, lidar_i]
+                if count > wp.int32(0):
+                    pixel_idx = support_pixels[vis_idx, lidar_i, 0]
+                    px = pixel_idx % LIDAR_IMAGE_WIDTH
+                    py = pixel_idx // LIDAR_IMAGE_WIDTH
+                    if py >= wp.int32(0) and py < LIDAR_IMAGE_HEIGHT and px >= wp.int32(0) and px < LIDAR_IMAGE_WIDTH:
+                        row = lidar_i * LIDAR_IMAGE_HEIGHT + py
+                        rgb = rgb_images_flat[row, px]
+                        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 0, wp.float16(wp.float32(rgb[0]) * inv_255))
+                        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 1, wp.float16(wp.float32(rgb[1]) * inv_255))
+                        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 2, wp.float16(wp.float32(rgb[2]) * inv_255))
+                        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 3, wp.float16(1.0))
+                return
+            v_float = (max_elev - elevation) * (
+                wp.float32(LIDAR_IMAGE_HEIGHT - wp.int32(1)) / (max_elev - min_elev)
+            )
+
+        azimuth = wp.atan2(node_lidar[1], node_lidar[0])
+        u_float = (azimuth + PI) * (wp.float32(LIDAR_IMAGE_WIDTH) / TWO_PI)
+        if u_float >= wp.float32(LIDAR_IMAGE_WIDTH):
+            u_float = u_float - wp.float32(LIDAR_IMAGE_WIDTH)
+        if u_float < wp.float32(0.0):
+            u_float = u_float + wp.float32(LIDAR_IMAGE_WIDTH)
+
+        u0 = wp.int32(wp.floor(u_float))
+        if u0 < wp.int32(0):
+            u0 = u0 + LIDAR_IMAGE_WIDTH
+        if u0 >= LIDAR_IMAGE_WIDTH:
+            u0 = u0 - LIDAR_IMAGE_WIDTH
+        u1 = u0 + wp.int32(1)
+        if u1 >= LIDAR_IMAGE_WIDTH:
+            u1 = wp.int32(0)
+        fu = u_float - wp.floor(u_float)
+
+        v0 = wp.int32(0)
+        v1 = wp.int32(0)
+        fv = wp.float32(0.0)
+        if LIDAR_IMAGE_HEIGHT > wp.int32(1):
+            v0 = wp.int32(wp.floor(v_float))
+            if v0 < wp.int32(0) or v0 >= LIDAR_IMAGE_HEIGHT:
+                count = support_counts[vis_idx, lidar_i]
+                if count > wp.int32(0):
+                    pixel_idx = support_pixels[vis_idx, lidar_i, 0]
+                    px = pixel_idx % LIDAR_IMAGE_WIDTH
+                    py = pixel_idx // LIDAR_IMAGE_WIDTH
+                    if py >= wp.int32(0) and py < LIDAR_IMAGE_HEIGHT and px >= wp.int32(0) and px < LIDAR_IMAGE_WIDTH:
+                        row = lidar_i * LIDAR_IMAGE_HEIGHT + py
+                        rgb = rgb_images_flat[row, px]
+                        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 0, wp.float16(wp.float32(rgb[0]) * inv_255))
+                        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 1, wp.float16(wp.float32(rgb[1]) * inv_255))
+                        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 2, wp.float16(wp.float32(rgb[2]) * inv_255))
+                        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 3, wp.float16(1.0))
+                return
+            v1 = wp.min(v0 + wp.int32(1), LIDAR_IMAGE_HEIGHT - wp.int32(1))
+            fv = v_float - wp.float32(v0)
+
+        wx0 = wp.float32(1.0) - fu
+        wy0 = wp.float32(1.0) - fv
+        w00 = wx0 * wy0
+        w10 = fu * wy0
+        w01 = wx0 * fv
+        w11 = fu * fv
         total_r = wp.float32(0.0)
         total_g = wp.float32(0.0)
         total_b = wp.float32(0.0)
-        for k in range(support_capacity):
-            if k < count:
-                pixel_idx = support_pixels[vis_idx, lidar_i, k]
+        total_w = wp.float32(0.0)
+
+        range00 = range_images[lidar_i, v0, u0]
+        if _range_valid(range00, min_range, max_range):
+            sdf00 = range00 - node_range
+            if sdf00 >= -TRUNCATION_DIST and sdf00 <= TRUNCATION_DIST:
+                weight00 = w00 * compute_tsdf_weight(range00, VOXEL_SIZE)
+                row00 = lidar_i * LIDAR_IMAGE_HEIGHT + v0
+                rgb00 = rgb_images_flat[row00, u0]
+                total_r = total_r + wp.float32(rgb00[0]) * inv_255 * weight00
+                total_g = total_g + wp.float32(rgb00[1]) * inv_255 * weight00
+                total_b = total_b + wp.float32(rgb00[2]) * inv_255 * weight00
+                total_w = total_w + weight00
+
+        range10 = range_images[lidar_i, v0, u1]
+        if _range_valid(range10, min_range, max_range):
+            sdf10 = range10 - node_range
+            if sdf10 >= -TRUNCATION_DIST and sdf10 <= TRUNCATION_DIST:
+                weight10 = w10 * compute_tsdf_weight(range10, VOXEL_SIZE)
+                row10 = lidar_i * LIDAR_IMAGE_HEIGHT + v0
+                rgb10 = rgb_images_flat[row10, u1]
+                total_r = total_r + wp.float32(rgb10[0]) * inv_255 * weight10
+                total_g = total_g + wp.float32(rgb10[1]) * inv_255 * weight10
+                total_b = total_b + wp.float32(rgb10[2]) * inv_255 * weight10
+                total_w = total_w + weight10
+
+        range01 = range_images[lidar_i, v1, u0]
+        if _range_valid(range01, min_range, max_range):
+            sdf01 = range01 - node_range
+            if sdf01 >= -TRUNCATION_DIST and sdf01 <= TRUNCATION_DIST:
+                weight01 = w01 * compute_tsdf_weight(range01, VOXEL_SIZE)
+                row01 = lidar_i * LIDAR_IMAGE_HEIGHT + v1
+                rgb01 = rgb_images_flat[row01, u0]
+                total_r = total_r + wp.float32(rgb01[0]) * inv_255 * weight01
+                total_g = total_g + wp.float32(rgb01[1]) * inv_255 * weight01
+                total_b = total_b + wp.float32(rgb01[2]) * inv_255 * weight01
+                total_w = total_w + weight01
+
+        range11 = range_images[lidar_i, v1, u1]
+        if _range_valid(range11, min_range, max_range):
+            sdf11 = range11 - node_range
+            if sdf11 >= -TRUNCATION_DIST and sdf11 <= TRUNCATION_DIST:
+                weight11 = w11 * compute_tsdf_weight(range11, VOXEL_SIZE)
+                row11 = lidar_i * LIDAR_IMAGE_HEIGHT + v1
+                rgb11 = rgb_images_flat[row11, u1]
+                total_r = total_r + wp.float32(rgb11[0]) * inv_255 * weight11
+                total_g = total_g + wp.float32(rgb11[1]) * inv_255 * weight11
+                total_b = total_b + wp.float32(rgb11[2]) * inv_255 * weight11
+                total_w = total_w + weight11
+
+        if total_w > wp.float32(0.0):
+            wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 0, wp.float16(total_r))
+            wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 1, wp.float16(total_g))
+            wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 2, wp.float16(total_b))
+            wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 3, wp.float16(total_w))
+        else:
+            count = support_counts[vis_idx, lidar_i]
+            if count > wp.int32(0):
+                pixel_idx = support_pixels[vis_idx, lidar_i, 0]
                 px = pixel_idx % LIDAR_IMAGE_WIDTH
                 py = pixel_idx // LIDAR_IMAGE_WIDTH
-                row = lidar_i * LIDAR_IMAGE_HEIGHT + py
-                total_r = total_r + wp.float32(rgb_images_flat[row, px, 0]) * inv_255
-                total_g = total_g + wp.float32(rgb_images_flat[row, px, 1]) * inv_255
-                total_b = total_b + wp.float32(rgb_images_flat[row, px, 2]) * inv_255
-
-        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 0, wp.float16(total_r))
-        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 1, wp.float16(total_g))
-        wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 2, wp.float16(total_b))
-        wp.atomic_add(
-            block_grid_rgb,
-            pool_idx,
-            node_idx,
-            3,
-            wp.float16(wp.float32(count)),
-        )
+                if py >= wp.int32(0) and py < LIDAR_IMAGE_HEIGHT and px >= wp.int32(0) and px < LIDAR_IMAGE_WIDTH:
+                    row = lidar_i * LIDAR_IMAGE_HEIGHT + py
+                    rgb = rgb_images_flat[row, px]
+                    wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 0, wp.float16(wp.float32(rgb[0]) * inv_255))
+                    wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 1, wp.float16(wp.float32(rgb[1]) * inv_255))
+                    wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 2, wp.float16(wp.float32(rgb[2]) * inv_255))
+                    wp.atomic_add(block_grid_rgb, pool_idx, node_idx, 3, wp.float16(1.0))
 
     @warp_kernel(
         f"lidar_integrate_features_from_support_grouped_kernel_{suffix}_fcpt"
@@ -525,42 +746,262 @@ def make_lidar_integrate_kernels(
     def lidar_integrate_features_from_support_grouped_kernel(
         visible_pool_indices: wp.array(dtype=wp.int32),
         n_visible: wp.int32,
+        lidar_positions: wp.array2d(dtype=wp.float32),
+        lidar_quaternions: wp.array2d(dtype=wp.float32),
+        range_images: wp.array3d(dtype=wp.float32),
+        valid_range_m: wp.array2d(dtype=wp.float32),
+        elevation_range_rad: wp.array2d(dtype=wp.float32),
+        block_coords: wp.array(dtype=wp.int32),
         support_counts: wp.array2d(dtype=wp.int32),
         support_pixels: wp.array3d(dtype=wp.int32),
         feature_grid: wp.array4d(dtype=wp.float16),
-        block_features: wp.array2d(dtype=wp.float16),
-        block_feature_weight: wp.array(dtype=wp.float16),
+        block_features: wp.array3d(dtype=wp.float16),
+        block_feature_weight: wp.array2d(dtype=wp.float16),
     ):
-        vis_idx, lidar_i, feature_channel_group_idx = wp.tid()
         n_channel_groups = (FEATURE_DIM + FEATURE_CHANNELS_PER_THREAD - wp.int32(1)) // FEATURE_CHANNELS_PER_THREAD
-        if vis_idx >= n_visible or feature_channel_group_idx >= n_channel_groups:
+        vis_idx, lidar_i, node_group_idx = wp.tid()
+        node_idx = node_group_idx // n_channel_groups
+        feature_channel_group_idx = node_group_idx - node_idx * n_channel_groups
+        if (
+            vis_idx >= n_visible
+            or node_idx >= FEATURE_GRID_VOXELS
+            or feature_channel_group_idx >= n_channel_groups
+        ):
             return
 
         pool_idx = visible_pool_indices[vis_idx]
         if pool_idx < wp.int32(0):
             return
-        count = support_counts[vis_idx, lidar_i]
-        if count > SUPPORT_CAPACITY:
-            count = SUPPORT_CAPACITY
-        if count <= wp.int32(0):
-            return
+
+        bx = block_coords[pool_idx * 3 + 0]
+        by = block_coords[pool_idx * 3 + 1]
+        bz = block_coords[pool_idx * 3 + 2]
+
+        gx_node = node_idx % FEATURE_BLOCK_GRID_SIZE
+        gy_node = (node_idx // FEATURE_BLOCK_GRID_SIZE) % FEATURE_BLOCK_GRID_SIZE
+        gz_node = node_idx // (FEATURE_BLOCK_GRID_SIZE * FEATURE_BLOCK_GRID_SIZE)
+
+        local_x = wp.float32(0.0)
+        local_y = wp.float32(0.0)
+        local_z = wp.float32(0.0)
+        if FEATURE_BLOCK_GRID_SIZE > wp.int32(1):
+            span = wp.float32(BLOCK_SIZE - wp.int32(1))
+            denom = wp.float32(FEATURE_BLOCK_GRID_SIZE - wp.int32(1))
+            local_x = wp.float32(0.5) + wp.float32(gx_node) * span / denom
+            local_y = wp.float32(0.5) + wp.float32(gy_node) * span / denom
+            local_z = wp.float32(0.5) + wp.float32(gz_node) * span / denom
+        else:
+            center = wp.float32(BLOCK_SIZE) * wp.float32(0.5)
+            local_x = center
+            local_y = center
+            local_z = center
+
+        base = block_key_to_voxel_base(bx, by, bz)
+        center_offset_x = wp.float32(GRID_W) * wp.float32(0.5)
+        center_offset_y = wp.float32(GRID_H) * wp.float32(0.5)
+        center_offset_z = wp.float32(GRID_D) * wp.float32(0.5)
+        node_world = (
+            wp.vec3(ORIGIN_X, ORIGIN_Y, ORIGIN_Z)
+            + wp.vec3(
+                wp.float32(base[0]) + local_x - center_offset_x,
+                wp.float32(base[1]) + local_y - center_offset_y,
+                wp.float32(base[2]) + local_z - center_offset_z,
+            )
+            * VOXEL_SIZE
+        )
 
         base_feature_channel = feature_channel_group_idx * FEATURE_CHANNELS_PER_THREAD
         feature_acc = wp.zeros(FEATURE_CHANNELS_PER_THREAD, dtype=wp.float32)
-        for k in range(support_capacity):
-            if k < count:
-                pixel_idx = support_pixels[vis_idx, lidar_i, k]
+        total_w = wp.float32(0.0)
+
+        lidar_pos = wp.vec3(
+            lidar_positions[lidar_i, 0],
+            lidar_positions[lidar_i, 1],
+            lidar_positions[lidar_i, 2],
+        )
+        lidar_quat = wp.quaternion(
+            lidar_quaternions[lidar_i, 1],
+            lidar_quaternions[lidar_i, 2],
+            lidar_quaternions[lidar_i, 3],
+            lidar_quaternions[lidar_i, 0],
+        )
+        node_lidar = wp.quat_rotate(wp.quat_inverse(lidar_quat), node_world - lidar_pos)
+        node_range = wp.sqrt(wp.dot(node_lidar, node_lidar))
+        min_range = valid_range_m[lidar_i, 0]
+        max_range = valid_range_m[lidar_i, 1]
+
+        if _range_valid(node_range, min_range, max_range):
+            min_elev = elevation_range_rad[lidar_i, 0]
+            max_elev = elevation_range_rad[lidar_i, 1]
+            xy_norm = wp.sqrt(node_lidar[0] * node_lidar[0] + node_lidar[1] * node_lidar[1])
+            elevation = wp.atan2(node_lidar[2], xy_norm)
+            can_project = bool(True)
+            v_float = wp.float32(0.0)
+            if LIDAR_IMAGE_HEIGHT > wp.int32(1):
+                if elevation < min_elev or elevation > max_elev:
+                    can_project = False
+                else:
+                    v_float = (max_elev - elevation) * (
+                        wp.float32(LIDAR_IMAGE_HEIGHT - wp.int32(1))
+                        / (max_elev - min_elev)
+                    )
+
+            if can_project:
+                azimuth = wp.atan2(node_lidar[1], node_lidar[0])
+                u_float = (azimuth + PI) * (wp.float32(LIDAR_IMAGE_WIDTH) / TWO_PI)
+                if u_float >= wp.float32(LIDAR_IMAGE_WIDTH):
+                    u_float = u_float - wp.float32(LIDAR_IMAGE_WIDTH)
+                if u_float < wp.float32(0.0):
+                    u_float = u_float + wp.float32(LIDAR_IMAGE_WIDTH)
+
+                u0 = wp.int32(wp.floor(u_float))
+                if u0 < wp.int32(0):
+                    u0 = u0 + LIDAR_IMAGE_WIDTH
+                if u0 >= LIDAR_IMAGE_WIDTH:
+                    u0 = u0 - LIDAR_IMAGE_WIDTH
+                u1 = u0 + wp.int32(1)
+                if u1 >= LIDAR_IMAGE_WIDTH:
+                    u1 = wp.int32(0)
+                fu = u_float - wp.floor(u_float)
+
+                v0 = wp.int32(0)
+                v1 = wp.int32(0)
+                fv = wp.float32(0.0)
+                can_sample = bool(True)
+                if LIDAR_IMAGE_HEIGHT > wp.int32(1):
+                    v0 = wp.int32(wp.floor(v_float))
+                    if v0 < wp.int32(0) or v0 >= LIDAR_IMAGE_HEIGHT:
+                        can_sample = False
+                    else:
+                        v1 = wp.min(v0 + wp.int32(1), LIDAR_IMAGE_HEIGHT - wp.int32(1))
+                        fv = v_float - wp.float32(v0)
+
+                if can_sample:
+                    wx0 = wp.float32(1.0) - fu
+                    wy0 = wp.float32(1.0) - fv
+                    w00 = wx0 * wy0
+                    w10 = fu * wy0
+                    w01 = wx0 * fv
+                    w11 = fu * fv
+
+                    range00 = range_images[lidar_i, v0, u0]
+                    if _range_valid(range00, min_range, max_range):
+                        sdf00 = range00 - node_range
+                        if sdf00 >= -TRUNCATION_DIST and sdf00 <= TRUNCATION_DIST:
+                            sample_w = w00 * compute_tsdf_weight(range00, VOXEL_SIZE)
+                            fg = _lidar_feature_grid_coords(u0, v0)
+                            for feature_channel_offset in range(feature_channels_per_thread):
+                                feature_channel = base_feature_channel + feature_channel_offset
+                                if feature_channel < FEATURE_DIM:
+                                    feature_acc[feature_channel_offset] = (
+                                        feature_acc[feature_channel_offset]
+                                        + wp.float32(
+                                            feature_grid[
+                                                lidar_i,
+                                                fg[1],
+                                                fg[0],
+                                                feature_channel,
+                                            ]
+                                        )
+                                        * sample_w
+                                    )
+                            total_w = total_w + sample_w
+
+                    range10 = range_images[lidar_i, v0, u1]
+                    if _range_valid(range10, min_range, max_range):
+                        sdf10 = range10 - node_range
+                        if sdf10 >= -TRUNCATION_DIST and sdf10 <= TRUNCATION_DIST:
+                            sample_w = w10 * compute_tsdf_weight(range10, VOXEL_SIZE)
+                            fg = _lidar_feature_grid_coords(u1, v0)
+                            for feature_channel_offset in range(feature_channels_per_thread):
+                                feature_channel = base_feature_channel + feature_channel_offset
+                                if feature_channel < FEATURE_DIM:
+                                    feature_acc[feature_channel_offset] = (
+                                        feature_acc[feature_channel_offset]
+                                        + wp.float32(
+                                            feature_grid[
+                                                lidar_i,
+                                                fg[1],
+                                                fg[0],
+                                                feature_channel,
+                                            ]
+                                        )
+                                        * sample_w
+                                    )
+                            total_w = total_w + sample_w
+
+                    range01 = range_images[lidar_i, v1, u0]
+                    if _range_valid(range01, min_range, max_range):
+                        sdf01 = range01 - node_range
+                        if sdf01 >= -TRUNCATION_DIST and sdf01 <= TRUNCATION_DIST:
+                            sample_w = w01 * compute_tsdf_weight(range01, VOXEL_SIZE)
+                            fg = _lidar_feature_grid_coords(u0, v1)
+                            for feature_channel_offset in range(feature_channels_per_thread):
+                                feature_channel = base_feature_channel + feature_channel_offset
+                                if feature_channel < FEATURE_DIM:
+                                    feature_acc[feature_channel_offset] = (
+                                        feature_acc[feature_channel_offset]
+                                        + wp.float32(
+                                            feature_grid[
+                                                lidar_i,
+                                                fg[1],
+                                                fg[0],
+                                                feature_channel,
+                                            ]
+                                        )
+                                        * sample_w
+                                    )
+                            total_w = total_w + sample_w
+
+                    range11 = range_images[lidar_i, v1, u1]
+                    if _range_valid(range11, min_range, max_range):
+                        sdf11 = range11 - node_range
+                        if sdf11 >= -TRUNCATION_DIST and sdf11 <= TRUNCATION_DIST:
+                            sample_w = w11 * compute_tsdf_weight(range11, VOXEL_SIZE)
+                            fg = _lidar_feature_grid_coords(u1, v1)
+                            for feature_channel_offset in range(feature_channels_per_thread):
+                                feature_channel = base_feature_channel + feature_channel_offset
+                                if feature_channel < FEATURE_DIM:
+                                    feature_acc[feature_channel_offset] = (
+                                        feature_acc[feature_channel_offset]
+                                        + wp.float32(
+                                            feature_grid[
+                                                lidar_i,
+                                                fg[1],
+                                                fg[0],
+                                                feature_channel,
+                                            ]
+                                        )
+                                        * sample_w
+                                    )
+                            total_w = total_w + sample_w
+
+        if total_w <= wp.float32(0.0):
+            count = support_counts[vis_idx, lidar_i]
+            if count > wp.int32(0):
+                pixel_idx = support_pixels[vis_idx, lidar_i, 0]
                 px = pixel_idx % LIDAR_IMAGE_WIDTH
                 py = pixel_idx // LIDAR_IMAGE_WIDTH
-                gx = (px * LIDAR_FEATURE_GRID_WIDTH) // LIDAR_IMAGE_WIDTH
-                gy = (py * LIDAR_FEATURE_GRID_HEIGHT) // LIDAR_IMAGE_HEIGHT
-                for feature_channel_offset in range(feature_channels_per_thread):
-                    feature_channel = base_feature_channel + feature_channel_offset
-                    if feature_channel < FEATURE_DIM:
-                        feature_acc[feature_channel_offset] = (
-                            feature_acc[feature_channel_offset]
-                            + wp.float32(feature_grid[lidar_i, gy, gx, feature_channel])
-                        )
+                if py >= wp.int32(0) and py < LIDAR_IMAGE_HEIGHT and px >= wp.int32(0) and px < LIDAR_IMAGE_WIDTH:
+                    fg = _lidar_feature_grid_coords(px, py)
+                    for feature_channel_offset in range(feature_channels_per_thread):
+                        feature_channel = base_feature_channel + feature_channel_offset
+                        if feature_channel < FEATURE_DIM:
+                            feature_acc[feature_channel_offset] = (
+                                feature_acc[feature_channel_offset]
+                                + wp.float32(
+                                    feature_grid[
+                                        lidar_i,
+                                        fg[1],
+                                        fg[0],
+                                        feature_channel,
+                                    ]
+                                )
+                            )
+                    total_w = total_w + wp.float32(1.0)
+
+        if total_w <= wp.float32(0.0):
+            return
 
         for feature_channel_offset in range(feature_channels_per_thread):
             feature_channel = base_feature_channel + feature_channel_offset
@@ -568,11 +1009,12 @@ def make_lidar_integrate_kernels(
                 wp.atomic_add(
                     block_features,
                     pool_idx,
+                    node_idx,
                     feature_channel,
                     wp.float16(feature_acc[feature_channel_offset]),
                 )
         if base_feature_channel == wp.int32(0):
-            wp.atomic_add(block_feature_weight, pool_idx, wp.float16(wp.float32(count)))
+            wp.atomic_add(block_feature_weight, pool_idx, node_idx, wp.float16(total_w))
 
     @warp_kernel(
         f"lidar_integrate_features_from_support_tiled_kernel_{suffix}_tile"
@@ -581,51 +1023,247 @@ def make_lidar_integrate_kernels(
     def lidar_integrate_features_from_support_tiled_kernel(
         visible_pool_indices: wp.array(dtype=wp.int32),
         n_visible: wp.int32,
+        lidar_positions: wp.array2d(dtype=wp.float32),
+        lidar_quaternions: wp.array2d(dtype=wp.float32),
+        range_images: wp.array3d(dtype=wp.float32),
+        valid_range_m: wp.array2d(dtype=wp.float32),
+        elevation_range_rad: wp.array2d(dtype=wp.float32),
+        block_coords: wp.array(dtype=wp.int32),
         support_counts: wp.array2d(dtype=wp.int32),
         support_pixels: wp.array3d(dtype=wp.int32),
         feature_grid: wp.array4d(dtype=wp.float16),
-        block_features: wp.array2d(dtype=wp.float16),
-        block_feature_weight: wp.array(dtype=wp.float16),
+        block_features: wp.array3d(dtype=wp.float16),
+        block_feature_weight: wp.array2d(dtype=wp.float16),
     ):
-        vis_idx, lidar_i, feature_tile_idx, lane = wp.tid()
         n_channel_tiles = (FEATURE_DIM + FEATURE_TILE_CHANNELS - wp.int32(1)) // FEATURE_TILE_CHANNELS
-        if vis_idx >= n_visible or feature_tile_idx >= n_channel_tiles:
+        vis_idx, lidar_i, node_tile_idx, lane = wp.tid()
+        node_idx = node_tile_idx // n_channel_tiles
+        feature_tile_idx = node_tile_idx - node_idx * n_channel_tiles
+        if (
+            vis_idx >= n_visible
+            or node_idx >= FEATURE_GRID_VOXELS
+            or feature_tile_idx >= n_channel_tiles
+        ):
             return
         pool_idx = visible_pool_indices[vis_idx]
         if pool_idx < wp.int32(0):
             return
-        count = support_counts[vis_idx, lidar_i]
-        if count > SUPPORT_CAPACITY:
-            count = SUPPORT_CAPACITY
-        if count <= wp.int32(0):
-            return
+
+        bx = block_coords[pool_idx * 3 + 0]
+        by = block_coords[pool_idx * 3 + 1]
+        bz = block_coords[pool_idx * 3 + 2]
+
+        gx_node = node_idx % FEATURE_BLOCK_GRID_SIZE
+        gy_node = (node_idx // FEATURE_BLOCK_GRID_SIZE) % FEATURE_BLOCK_GRID_SIZE
+        gz_node = node_idx // (FEATURE_BLOCK_GRID_SIZE * FEATURE_BLOCK_GRID_SIZE)
+
+        local_x = wp.float32(0.0)
+        local_y = wp.float32(0.0)
+        local_z = wp.float32(0.0)
+        if FEATURE_BLOCK_GRID_SIZE > wp.int32(1):
+            span = wp.float32(BLOCK_SIZE - wp.int32(1))
+            denom = wp.float32(FEATURE_BLOCK_GRID_SIZE - wp.int32(1))
+            local_x = wp.float32(0.5) + wp.float32(gx_node) * span / denom
+            local_y = wp.float32(0.5) + wp.float32(gy_node) * span / denom
+            local_z = wp.float32(0.5) + wp.float32(gz_node) * span / denom
+        else:
+            center = wp.float32(BLOCK_SIZE) * wp.float32(0.5)
+            local_x = center
+            local_y = center
+            local_z = center
+
+        base = block_key_to_voxel_base(bx, by, bz)
+        center_offset_x = wp.float32(GRID_W) * wp.float32(0.5)
+        center_offset_y = wp.float32(GRID_H) * wp.float32(0.5)
+        center_offset_z = wp.float32(GRID_D) * wp.float32(0.5)
+        node_world = (
+            wp.vec3(ORIGIN_X, ORIGIN_Y, ORIGIN_Z)
+            + wp.vec3(
+                wp.float32(base[0]) + local_x - center_offset_x,
+                wp.float32(base[1]) + local_y - center_offset_y,
+                wp.float32(base[2]) + local_z - center_offset_z,
+            )
+            * VOXEL_SIZE
+        )
 
         base_feature_channel = feature_tile_idx * FEATURE_TILE_CHANNELS
         feature_acc = wp.tile_zeros(shape=feature_tile_channels, dtype=wp.float32)
-        for k in range(support_capacity):
-            if k < count:
-                pixel_idx = support_pixels[vis_idx, lidar_i, k]
+        total_w = wp.float32(0.0)
+
+        lidar_pos = wp.vec3(
+            lidar_positions[lidar_i, 0],
+            lidar_positions[lidar_i, 1],
+            lidar_positions[lidar_i, 2],
+        )
+        lidar_quat = wp.quaternion(
+            lidar_quaternions[lidar_i, 1],
+            lidar_quaternions[lidar_i, 2],
+            lidar_quaternions[lidar_i, 3],
+            lidar_quaternions[lidar_i, 0],
+        )
+        node_lidar = wp.quat_rotate(wp.quat_inverse(lidar_quat), node_world - lidar_pos)
+        node_range = wp.sqrt(wp.dot(node_lidar, node_lidar))
+        min_range = valid_range_m[lidar_i, 0]
+        max_range = valid_range_m[lidar_i, 1]
+
+        if _range_valid(node_range, min_range, max_range):
+            min_elev = elevation_range_rad[lidar_i, 0]
+            max_elev = elevation_range_rad[lidar_i, 1]
+            xy_norm = wp.sqrt(node_lidar[0] * node_lidar[0] + node_lidar[1] * node_lidar[1])
+            elevation = wp.atan2(node_lidar[2], xy_norm)
+            can_project = bool(True)
+            v_float = wp.float32(0.0)
+            if LIDAR_IMAGE_HEIGHT > wp.int32(1):
+                if elevation < min_elev or elevation > max_elev:
+                    can_project = False
+                else:
+                    v_float = (max_elev - elevation) * (
+                        wp.float32(LIDAR_IMAGE_HEIGHT - wp.int32(1))
+                        / (max_elev - min_elev)
+                    )
+
+            if can_project:
+                azimuth = wp.atan2(node_lidar[1], node_lidar[0])
+                u_float = (azimuth + PI) * (wp.float32(LIDAR_IMAGE_WIDTH) / TWO_PI)
+                if u_float >= wp.float32(LIDAR_IMAGE_WIDTH):
+                    u_float = u_float - wp.float32(LIDAR_IMAGE_WIDTH)
+                if u_float < wp.float32(0.0):
+                    u_float = u_float + wp.float32(LIDAR_IMAGE_WIDTH)
+
+                u0 = wp.int32(wp.floor(u_float))
+                if u0 < wp.int32(0):
+                    u0 = u0 + LIDAR_IMAGE_WIDTH
+                if u0 >= LIDAR_IMAGE_WIDTH:
+                    u0 = u0 - LIDAR_IMAGE_WIDTH
+                u1 = u0 + wp.int32(1)
+                if u1 >= LIDAR_IMAGE_WIDTH:
+                    u1 = wp.int32(0)
+                fu = u_float - wp.floor(u_float)
+
+                v0 = wp.int32(0)
+                v1 = wp.int32(0)
+                fv = wp.float32(0.0)
+                can_sample = bool(True)
+                if LIDAR_IMAGE_HEIGHT > wp.int32(1):
+                    v0 = wp.int32(wp.floor(v_float))
+                    if v0 < wp.int32(0) or v0 >= LIDAR_IMAGE_HEIGHT:
+                        can_sample = False
+                    else:
+                        v1 = wp.min(v0 + wp.int32(1), LIDAR_IMAGE_HEIGHT - wp.int32(1))
+                        fv = v_float - wp.float32(v0)
+
+                if can_sample:
+                    wx0 = wp.float32(1.0) - fu
+                    wy0 = wp.float32(1.0) - fv
+                    w00 = wx0 * wy0
+                    w10 = fu * wy0
+                    w01 = wx0 * fv
+                    w11 = fu * fv
+
+                    range00 = range_images[lidar_i, v0, u0]
+                    if _range_valid(range00, min_range, max_range):
+                        sdf00 = range00 - node_range
+                        if sdf00 >= -TRUNCATION_DIST and sdf00 <= TRUNCATION_DIST:
+                            sample_w = w00 * compute_tsdf_weight(range00, VOXEL_SIZE)
+                            fg = _lidar_feature_grid_coords(u0, v0)
+                            feature_vals_h = wp.tile_load(
+                                feature_grid[lidar_i, fg[1], fg[0]],
+                                shape=feature_tile_channels,
+                                offset=base_feature_channel,
+                                bounds_check=True,
+                            )
+                            feature_acc = feature_acc + wp.tile_astype(
+                                feature_vals_h,
+                                dtype=wp.float32,
+                            ) * sample_w
+                            total_w = total_w + sample_w
+
+                    range10 = range_images[lidar_i, v0, u1]
+                    if _range_valid(range10, min_range, max_range):
+                        sdf10 = range10 - node_range
+                        if sdf10 >= -TRUNCATION_DIST and sdf10 <= TRUNCATION_DIST:
+                            sample_w = w10 * compute_tsdf_weight(range10, VOXEL_SIZE)
+                            fg = _lidar_feature_grid_coords(u1, v0)
+                            feature_vals_h = wp.tile_load(
+                                feature_grid[lidar_i, fg[1], fg[0]],
+                                shape=feature_tile_channels,
+                                offset=base_feature_channel,
+                                bounds_check=True,
+                            )
+                            feature_acc = feature_acc + wp.tile_astype(
+                                feature_vals_h,
+                                dtype=wp.float32,
+                            ) * sample_w
+                            total_w = total_w + sample_w
+
+                    range01 = range_images[lidar_i, v1, u0]
+                    if _range_valid(range01, min_range, max_range):
+                        sdf01 = range01 - node_range
+                        if sdf01 >= -TRUNCATION_DIST and sdf01 <= TRUNCATION_DIST:
+                            sample_w = w01 * compute_tsdf_weight(range01, VOXEL_SIZE)
+                            fg = _lidar_feature_grid_coords(u0, v1)
+                            feature_vals_h = wp.tile_load(
+                                feature_grid[lidar_i, fg[1], fg[0]],
+                                shape=feature_tile_channels,
+                                offset=base_feature_channel,
+                                bounds_check=True,
+                            )
+                            feature_acc = feature_acc + wp.tile_astype(
+                                feature_vals_h,
+                                dtype=wp.float32,
+                            ) * sample_w
+                            total_w = total_w + sample_w
+
+                    range11 = range_images[lidar_i, v1, u1]
+                    if _range_valid(range11, min_range, max_range):
+                        sdf11 = range11 - node_range
+                        if sdf11 >= -TRUNCATION_DIST and sdf11 <= TRUNCATION_DIST:
+                            sample_w = w11 * compute_tsdf_weight(range11, VOXEL_SIZE)
+                            fg = _lidar_feature_grid_coords(u1, v1)
+                            feature_vals_h = wp.tile_load(
+                                feature_grid[lidar_i, fg[1], fg[0]],
+                                shape=feature_tile_channels,
+                                offset=base_feature_channel,
+                                bounds_check=True,
+                            )
+                            feature_acc = feature_acc + wp.tile_astype(
+                                feature_vals_h,
+                                dtype=wp.float32,
+                            ) * sample_w
+                            total_w = total_w + sample_w
+
+        if total_w <= wp.float32(0.0):
+            count = support_counts[vis_idx, lidar_i]
+            if count > wp.int32(0):
+                pixel_idx = support_pixels[vis_idx, lidar_i, 0]
                 px = pixel_idx % LIDAR_IMAGE_WIDTH
                 py = pixel_idx // LIDAR_IMAGE_WIDTH
-                gx = (px * LIDAR_FEATURE_GRID_WIDTH) // LIDAR_IMAGE_WIDTH
-                gy = (py * LIDAR_FEATURE_GRID_HEIGHT) // LIDAR_IMAGE_HEIGHT
-                feature_vals_h = wp.tile_load(
-                    feature_grid[lidar_i, gy, gx],
-                    shape=feature_tile_channels,
-                    offset=base_feature_channel,
-                    storage="global",
-                )
-                feature_acc = feature_acc + wp.tile_astype(feature_vals_h, dtype=wp.float32)
+                if py >= wp.int32(0) and py < LIDAR_IMAGE_HEIGHT and px >= wp.int32(0) and px < LIDAR_IMAGE_WIDTH:
+                    fg = _lidar_feature_grid_coords(px, py)
+                    feature_vals_h = wp.tile_load(
+                        feature_grid[lidar_i, fg[1], fg[0]],
+                        shape=feature_tile_channels,
+                        offset=base_feature_channel,
+                        bounds_check=True,
+                    )
+                    feature_acc = feature_acc + wp.tile_astype(
+                        feature_vals_h,
+                        dtype=wp.float32,
+                    )
+                    total_w = total_w + wp.float32(1.0)
+
+        if total_w <= wp.float32(0.0):
+            return
 
         feature_acc_h = wp.tile_astype(feature_acc, dtype=wp.float16)
         wp.tile_atomic_add(
-            block_features[pool_idx],
+            block_features[pool_idx, node_idx],
             feature_acc_h,
             offset=base_feature_channel,
-            storage="global",
+            bounds_check=True,
         )
         if feature_tile_idx == wp.int32(0) and lane == wp.int32(0):
-            wp.atomic_add(block_feature_weight, pool_idx, wp.float16(wp.float32(count)))
+            wp.atomic_add(block_feature_weight, pool_idx, node_idx, wp.float16(total_w))
 
     return {
         "lidar_compute_block_keys_only_kernel": lidar_compute_block_keys_only_kernel,
@@ -633,9 +1271,7 @@ def make_lidar_integrate_kernels(
             lidar_build_support_pixels_from_keys_kernel
         ),
         "lidar_integrate_voxels_kernel": lidar_integrate_voxels_kernel,
-        "lidar_integrate_block_grid_rgb_from_support_kernel": (
-            lidar_integrate_block_grid_rgb_from_support_kernel
-        ),
+        "lidar_integrate_block_grid_rgb_kernel": lidar_integrate_block_grid_rgb_kernel,
         "lidar_integrate_features_from_support_grouped_kernel": (
             lidar_integrate_features_from_support_grouped_kernel
         ),

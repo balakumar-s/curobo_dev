@@ -22,6 +22,7 @@ Example:
 """
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -34,12 +35,13 @@ from curobo._src.perception.mapper.block_allocation import (
 )
 from curobo._src.perception.mapper.constants import (
     DEFAULT_HASH_LAYOUT,
+    _validate_block_size,
     _validate_color_grid_size,
+    _validate_feature_block_grid_size,
     _validate_feature_channels_per_thread,
     _validate_feature_grid_shape,
     _validate_feature_integration_kernel,
     _validate_lidar_config,
-    _validate_block_size,
     resolve_feature_integration_kernel,
     validate_grid_shape_for_hash_layout,
 )
@@ -66,10 +68,12 @@ from curobo._src.perception.mapper.kernel.wp_voxel_extraction import (
     extract_occupied_voxels_block_sparse,
     extract_surface_voxels_block_sparse,
 )
-from curobo._src.perception.mapper.mesh_extractor import (
-    extract_approximate_mesh_block_sparse,
-    extract_mesh_block_sparse,
+from curobo._src.perception.mapper.mesh_extractor import extract_mesh_block_sparse
+from curobo._src.perception.mapper.projector_texture import (
+    ProjectiveTextureProjector,
+    ProjectiveTextureProjectorCfg,
 )
+from curobo._src.perception.mapper.renderer import BlockSparseTSDFRenderer
 from curobo._src.perception.mapper.storage import (
     BlockSparseTSDF,
     BlockSparseTSDFCfg,
@@ -78,9 +82,8 @@ from curobo._src.perception.mapper.storage import (
 )
 from curobo._src.types.camera import CameraObservation
 from curobo._src.types.lidar import LidarObservation
-from curobo._src.util.logging import log_info
+from curobo._src.util.logging import log_and_raise, log_info
 from curobo._src.util.torch_util import profile_class_methods
-from curobo.logging import log_and_raise
 
 
 @dataclass
@@ -130,6 +133,13 @@ class BlockSparseTSDFIntegratorCfg:
     roughness: float = 3.0  # Geometric complexity multiplier
     image_height: Optional[int] = None  # For buffer pre-allocation
     image_width: Optional[int] = None  # For buffer pre-allocation
+    #: Number of RGB cameras used by projective texture export. Defaults to
+    #: ``num_cameras`` when unset.
+    texture_num_cameras: Optional[int] = None
+    #: RGB texture camera image height in pixels. Defaults to ``image_height``.
+    texture_camera_image_height: Optional[int] = None
+    #: RGB texture camera image width in pixels. Defaults to ``image_width``.
+    texture_camera_image_width: Optional[int] = None
     lidar_num_sensors: int = 0
     lidar_image_height: Optional[int] = None
     lidar_image_width: Optional[int] = None
@@ -148,6 +158,10 @@ class BlockSparseTSDFIntegratorCfg:
     block_size: int = 8
     #: Per-block feature channel dimensionality. 0 disables features.
     feature_dim: int = 0
+    #: Number of feature control points per block edge. Independent from
+    #: ``feature_grid_height`` and ``feature_grid_width``, which describe the
+    #: incoming 2D camera feature image.
+    feature_block_grid_size: int = 1
     #: Compile-time feature-grid height. Required when ``feature_dim > 0``;
     #: must be ``None`` when features are disabled.
     feature_grid_height: Optional[int] = None
@@ -177,8 +191,8 @@ class BlockSparseTSDFIntegratorCfg:
     #: Record per-kernel integration timings into
     #: ``get_stats()["last_integration_kernel_timings_ms"]``.
     profile_integration_kernel_timings: bool = False
-    #: Upper bound on per-block accumulator weight after each frame. Caps
-    #: the fp16 weighted-sum magnitudes in ``block_grid_rgb`` and
+    #: Upper bound on each RGB or feature-grid node's weight after each frame.
+    #: Caps the fp16 weighted-sum magnitudes in ``block_grid_rgb`` and
     #: ``block_features``; also sets EMA decay rate
     #: ``W_max / mean_per_frame_weight`` for old observations. See
     #: :attr:`BlockSparseTSDFCfg.accumulator_w_max`.
@@ -273,6 +287,32 @@ class BlockSparseTSDFIntegratorCfg:
             )
         if self.num_cameras <= 0:
             log_and_raise(f"num_cameras must be positive, got num_cameras={self.num_cameras}.")
+        if (
+            self.texture_camera_image_height is None
+        ) != (self.texture_camera_image_width is None):
+            log_and_raise(
+                "texture_camera_image_height and texture_camera_image_width must be "
+                "specified together."
+            )
+        if self.texture_num_cameras is None:
+            self.texture_num_cameras = self.num_cameras
+        if self.texture_camera_image_height is None:
+            self.texture_camera_image_height = self.image_height
+            self.texture_camera_image_width = self.image_width
+        if self.texture_num_cameras <= 0:
+            log_and_raise(
+                "texture_num_cameras must be positive, got "
+                f"texture_num_cameras={self.texture_num_cameras}."
+            )
+        if (
+            self.texture_camera_image_height <= 0
+            or self.texture_camera_image_width <= 0
+        ):
+            log_and_raise(
+                "texture_camera_image_height and texture_camera_image_width must be "
+                "positive, got "
+                f"{self.texture_camera_image_height}x{self.texture_camera_image_width}."
+            )
         _validate_feature_channels_per_thread(self.feature_channels_per_thread)
         _validate_feature_grid_shape(
             self.feature_dim,
@@ -291,6 +331,10 @@ class BlockSparseTSDFIntegratorCfg:
                 f"{self.max_support_pixels_per_block_camera}."
             )
         _validate_color_grid_size(self.color_grid_size, self.block_size)
+        _validate_feature_block_grid_size(
+            self.feature_block_grid_size,
+            self.block_size,
+        )
         _validate_feature_integration_kernel(self.feature_integration_kernel)
         if not isinstance(self.profile_integration_kernel_timings, bool):
             log_and_raise(
@@ -366,6 +410,7 @@ class BlockSparseTSDFIntegrator:
             static_obstacle_color=config.static_obstacle_color,
             block_size=config.block_size,
             feature_dim=config.feature_dim,
+            feature_block_grid_size=config.feature_block_grid_size,
             feature_grid_height=config.feature_grid_height,
             feature_grid_width=config.feature_grid_width,
             feature_channels_per_thread=config.feature_channels_per_thread,
@@ -377,6 +422,19 @@ class BlockSparseTSDFIntegrator:
         if kernels is None:
             kernels = make_block_sparse_kernels(config)
         self._tsdf = BlockSparseTSDF(tsdf_config, kernels=kernels)
+        texture_renderer = BlockSparseTSDFRenderer(self)
+        self._texture_projector = ProjectiveTextureProjector(
+            tsdf=self._tsdf,
+            renderer=texture_renderer,
+            config=ProjectiveTextureProjectorCfg(
+                texture_num_cameras=int(config.texture_num_cameras),
+                image_height=int(config.texture_camera_image_height),
+                image_width=int(config.texture_camera_image_width),
+                depth_minimum_distance=float(config.depth_minimum_distance),
+                depth_maximum_distance=float(config.depth_maximum_distance),
+                voxel_size=float(config.voxel_size),
+            ),
+        )
 
         # Frame counter for periodic operations
         self._frame_count = 0
@@ -880,12 +938,11 @@ class BlockSparseTSDFIntegrator:
 
     def extract_mesh(
         self,
-        refine_iterations: int = 2,
+        refine_iterations: int = 0,
         surface_only: bool = False,
         level: float = 0.0,
-        approximate: bool = False,
     ) -> Mesh:
-        """Extract mesh from the TSDF using marching cubes.
+        """Extract a triangle-soup mesh from the TSDF using marching cubes.
 
         Args:
             refine_iterations: Number of Newton-Raphson iterations for vertex refinement.
@@ -895,35 +952,25 @@ class BlockSparseTSDFIntegrator:
                 Excludes triangles from regions deep inside the object where TSDF
                 is clamped to -truncation_distance.
             level: Isosurface level (typically 0.0).
-            approximate: If True, use the approximate triangle-soup extractor
-                instead of the shared-vertex extractor.
-
 
         Returns:
-            Mesh object with vertices, triangles, normals, and colors.
+            Mesh object with one unique vertex for each triangle corner.
         """
-        if approximate:
-            vertices, triangles, normals, colors = extract_approximate_mesh_block_sparse(
-                self._tsdf,
-                level=level,
-                surface_only=surface_only,
-                minimum_tsdf_weight=self.config.minimum_tsdf_weight,
-            )
-        else:
-            vertices, triangles, normals, colors = extract_mesh_block_sparse(
-                self._tsdf,
-                level=level,
-                surface_only=surface_only,
-                refine_iterations=refine_iterations,
-                minimum_tsdf_weight=self.config.minimum_tsdf_weight,
-            )
+        vertices, normals, colors = extract_mesh_block_sparse(
+            self._tsdf,
+            level=level,
+            surface_only=surface_only,
+            refine_iterations=refine_iterations,
+            minimum_tsdf_weight=self.config.minimum_tsdf_weight,
+        )
+        triangles = torch.arange(
+            vertices.shape[0], dtype=torch.int32, device=vertices.device
+        ).view(-1, 3)
 
         # Convert tensors to lists for Mesh class
         # faces should be (N, 3) for trimesh compatibility
         return Mesh(
-            name="block_sparse_tsdf_approximate_mesh"
-            if approximate
-            else "block_sparse_tsdf_mesh",
+            name="block_sparse_tsdf_mesh",
             vertices=vertices,  # .cpu().tolist(),
             faces=triangles,  # .cpu().tolist(),  # Keep as (N, 3), not flattened
             vertex_colors=(colors.float() / 255.0),  # .cpu().tolist(),
@@ -935,9 +982,8 @@ class BlockSparseTSDFIntegrator:
         level: float = 0.0,
         surface_only: bool = False,
         refine_iterations: int = 0,
-        approximate: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Extract mesh as raw tensors.
+        """Extract a triangle-soup mesh as raw tensors.
 
         Args:
             level: Isosurface level (typically 0.0).
@@ -947,29 +993,189 @@ class BlockSparseTSDFIntegrator:
             refine_iterations: Number of Newton-Raphson iterations for vertex refinement.
                 0 = no refinement (linear interpolation only). Higher values (2-5)
                 produce smoother meshes at the cost of more computation.
-            approximate: If True, use the approximate triangle-soup extractor
-                instead of the shared-vertex extractor.
 
         Returns:
             Tuple of (vertices, triangles, normals, colors):
-                - vertices: (N, 3) float32
-                - triangles: (M, 3) int32
+                - vertices: (3 * M, 3) float32
+                - triangles: (M, 3) int32 identity indices into ``vertices``
                 - normals: (N, 3) float32
                 - colors: (N, 3) uint8
         """
-        if approximate:
-            return extract_approximate_mesh_block_sparse(
-                self._tsdf,
-                level=level,
-                surface_only=surface_only,
-                minimum_tsdf_weight=self.config.minimum_tsdf_weight,
-            )
-        return extract_mesh_block_sparse(
+        vertices, normals, colors = extract_mesh_block_sparse(
             self._tsdf,
             level=level,
             surface_only=surface_only,
             refine_iterations=refine_iterations,
             minimum_tsdf_weight=self.config.minimum_tsdf_weight,
+        )
+        triangles = torch.arange(
+            vertices.shape[0], dtype=torch.int32, device=vertices.device
+        ).view(-1, 3)
+        return vertices, triangles, normals, colors
+
+    def extract_textured_mesh(
+        self,
+        texture_observations: CameraObservation | Sequence[CameraObservation],
+        refine_iterations: int = 0,
+        surface_only: bool = True,
+        level: float = 0.0,
+        camera_min_distance: Optional[float] = None,
+        camera_max_distance: Optional[float] = None,
+        texture_depth_tolerance_m: Optional[float] = None,
+    ) -> Mesh:
+        """Extract a mesh with visibility-tested RGB texture.
+
+        The TSDF geometry can come from camera or LiDAR integration. Texture
+        projection consumes RGB images and aligned visibility depth. When an
+        observation omits depth, visibility depth is rendered from this TSDF.
+
+        Args:
+            texture_observations: Camera observation or sequence of camera
+                observations containing ``rgb_image``, ``intrinsics``, and
+                ``pose``. RGB tensors must be ``uint8``. Optional depth tensors
+                must be float32 camera-frame z in meters.
+            refine_iterations: Newton-Raphson iterations for vertex refinement.
+            surface_only: Only extract mesh near surface.
+            level: Isosurface level.
+            camera_min_distance: Minimum positive camera-frame Z distance used
+                for projection. Defaults to the mapper depth minimum.
+            camera_max_distance: Maximum camera-frame Z distance used for
+                projection. Defaults to the mapper depth maximum.
+            texture_depth_tolerance_m: Absolute visibility-depth tolerance. If
+                None, each sample uses ``max(2 * voxel_size, 0.01 * projected_z)``.
+
+        Returns:
+            Mesh with triangle-soup geometry, vertex colors, per-vertex UVs,
+            and an RGB texture atlas. Triangles that cannot be projected into
+            any RGB observation receive fallback UV patches filled from voxel
+            colors.
+        """
+        projection = self._texture_projector.prepare_mesh_projection(
+            texture_observations,
+            texture_depth_tolerance_m=texture_depth_tolerance_m,
+        )
+        vertices, triangles, normals, colors = self.extract_mesh_tensors(
+            level=level,
+            surface_only=surface_only,
+            refine_iterations=refine_iterations,
+        )
+        return self._texture_projector.project_mesh(
+            vertices,
+            triangles,
+            normals,
+            colors,
+            projection,
+            camera_min_distance=camera_min_distance,
+            camera_max_distance=camera_max_distance,
+        )
+
+    @staticmethod
+    def _validate_subvoxel_factor(subvoxel_factor: int) -> int:
+        """Return a positive integer subvoxel factor or raise."""
+        try:
+            factor = int(subvoxel_factor)
+        except (TypeError, ValueError):
+            log_and_raise(
+                f"subvoxel_factor must be a positive integer, got {subvoxel_factor}."
+            )
+        if isinstance(subvoxel_factor, bool) or factor != subvoxel_factor:
+            log_and_raise(
+                f"subvoxel_factor must be a positive integer, got {subvoxel_factor}."
+            )
+        if factor <= 0:
+            log_and_raise(f"subvoxel_factor must be positive, got {subvoxel_factor}.")
+        return factor
+
+    @staticmethod
+    def _validate_max_points(max_points: Optional[int]) -> Optional[int]:
+        """Return a positive integer point cap or ``None``."""
+        if max_points is None:
+            return None
+        try:
+            point_cap = int(max_points)
+        except (TypeError, ValueError):
+            log_and_raise(
+                f"max_points must be a positive integer or None, got {max_points}."
+            )
+        if isinstance(max_points, bool) or point_cap != max_points:
+            log_and_raise(
+                f"max_points must be a positive integer or None, got {max_points}."
+            )
+        if point_cap <= 0:
+            log_and_raise(f"max_points must be positive, got {max_points}.")
+        return point_cap
+
+    def _limit_voxels_for_point_cap(
+        self,
+        voxels: OccupiedVoxels,
+        *,
+        subvoxel_factor: int,
+        max_points: Optional[int],
+    ) -> OccupiedVoxels:
+        """Deterministically downsample source voxels before subvoxel expansion."""
+        point_cap = BlockSparseTSDFIntegrator._validate_max_points(max_points)
+        samples_per_voxel = subvoxel_factor**3
+        if point_cap is None or len(voxels) * samples_per_voxel <= point_cap:
+            return voxels
+
+        source_count = point_cap // samples_per_voxel
+        if source_count == 0:
+            empty_centers = voxels.centers[:0]
+            empty_blocks = voxels.block_idx_per_voxel[:0]
+            return OccupiedVoxels(
+                centers=empty_centers,
+                block_idx_per_voxel=empty_blocks,
+                block_data=voxels.block_data,
+            )
+
+        indices = torch.linspace(
+            0,
+            len(voxels) - 1,
+            steps=source_count,
+            device=voxels.centers.device,
+            dtype=torch.float32,
+        ).round().to(torch.long)
+        return OccupiedVoxels(
+            centers=voxels.centers[indices].contiguous(),
+            block_idx_per_voxel=voxels.block_idx_per_voxel[indices].contiguous(),
+            block_data=voxels.block_data,
+        )
+
+    def _expand_subvoxels(
+        self,
+        voxels: OccupiedVoxels,
+        *,
+        subvoxel_factor: int,
+    ) -> OccupiedVoxels:
+        """Return voxel centers or regular subvoxel sample centers."""
+        if subvoxel_factor == 1 or len(voxels) == 0:
+            return OccupiedVoxels(
+                centers=voxels.centers,
+                block_idx_per_voxel=voxels.block_idx_per_voxel,
+                block_data=voxels.block_data,
+                subvoxel_factor=subvoxel_factor,
+            )
+
+        device = voxels.centers.device
+        dtype = voxels.centers.dtype
+        offsets_1d = (
+            (torch.arange(subvoxel_factor, device=device, dtype=dtype) + 0.5)
+            / float(subvoxel_factor)
+            - 0.5
+        ) * float(self.config.voxel_size)
+        offset_grid = torch.stack(
+            torch.meshgrid(offsets_1d, offsets_1d, offsets_1d, indexing="ij"),
+            dim=-1,
+        ).reshape(-1, 3)
+        centers = (voxels.centers[:, None, :] + offset_grid[None, :, :]).reshape(-1, 3)
+        block_idx_per_voxel = voxels.block_idx_per_voxel.repeat_interleave(
+            subvoxel_factor**3
+        )
+        return OccupiedVoxels(
+            centers=centers.contiguous(),
+            block_idx_per_voxel=block_idx_per_voxel.contiguous(),
+            block_data=voxels.block_data,
+            subvoxel_factor=subvoxel_factor,
         )
 
     def get_stats(
@@ -1068,6 +1274,13 @@ class BlockSparseTSDFIntegrator:
         self,
         surface_only: bool = False,
         sdf_threshold: float = None,
+        *,
+        subvoxel_factor: int = 1,
+        max_points: Optional[int] = None,
+        texture_observations: CameraObservation | Sequence[CameraObservation] | None = None,
+        camera_min_distance: Optional[float] = None,
+        camera_max_distance: Optional[float] = None,
+        texture_depth_tolerance_m: Optional[float] = None,
     ) -> OccupiedVoxels:
         """Extract occupied voxel centers and per-voxel block indices.
 
@@ -1079,6 +1292,16 @@ class BlockSparseTSDFIntegrator:
             surface_only: If True, extract only surface voxels (|SDF| < sdf_threshold).
                           If False (default), include inside voxels too (SDF <= 0).
             sdf_threshold: Threshold for surface_only=True. Defaults to voxel_size.
+            subvoxel_factor: Number of point samples per extracted voxel axis.
+            max_points: Optional cap applied after subvoxel expansion by
+                downsampling source voxels before expansion.
+            texture_observations: Optional RGB or RGB-D texture observations used
+                to color output samples after visibility-depth checks. Missing
+                depth is rendered from the current TSDF.
+            camera_min_distance: Minimum camera-frame z used for texture projection.
+            camera_max_distance: Maximum camera-frame z used for texture projection.
+            texture_depth_tolerance_m: Absolute visibility-depth tolerance. If
+                None, each sample uses ``max(2 * voxel_size, 0.01 * projected_z)``.
 
         Returns:
             :class:`OccupiedVoxels` — ``.centers`` for voxel positions,
@@ -1086,16 +1309,34 @@ class BlockSparseTSDFIntegrator:
             ``.block_data`` as a read-only view over per-block storage.
             Use ``.colors_uint8()`` to gather per-voxel RGB.
         """
+        subvoxel_factor = BlockSparseTSDFIntegrator._validate_subvoxel_factor(
+            subvoxel_factor
+        )
         # Default threshold to voxel_size (matches dense behavior)
         if sdf_threshold is None:
             sdf_threshold = self.config.voxel_size
 
-        return extract_occupied_voxels_block_sparse(
+        voxels = extract_occupied_voxels_block_sparse(
             self._tsdf,
             surface_only=surface_only,
             sdf_threshold=sdf_threshold,
             minimum_tsdf_weight=self.config.minimum_tsdf_weight,
             grid_shape=self.config.grid_shape,
+        )
+        voxels = self._limit_voxels_for_point_cap(
+            voxels,
+            subvoxel_factor=subvoxel_factor,
+            max_points=max_points,
+        )
+        voxels = self._expand_subvoxels(voxels, subvoxel_factor=subvoxel_factor)
+        if texture_observations is None:
+            return voxels
+        return self._texture_projector.texture_occupied_voxels(
+            voxels,
+            texture_observations,
+            camera_min_distance=camera_min_distance,
+            camera_max_distance=camera_max_distance,
+            texture_depth_tolerance_m=texture_depth_tolerance_m,
         )
 
     def extract_matching_feature_voxels(
@@ -1191,8 +1432,13 @@ class BlockSparseTSDFIntegrator:
         # ulp loss on top of the post-frame rescale, and to match the
         # fp32 query vector for the dot product. Recycled pool slots may
         # retain stale storage, so score only active pool indices.
-        features = self._tsdf.data.block_features[active_pool_idx].float()
-        weight = self._tsdf.data.block_feature_weight[active_pool_idx].float().clamp(min=1e-6)
+        features = self._tsdf.data.block_features[active_pool_idx].float().sum(dim=1)
+        weight = (
+            self._tsdf.data.block_feature_weight[active_pool_idx]
+            .float()
+            .sum(dim=1)
+            .clamp(min=1e-6)
+        )
         normalized = features / weight.unsqueeze(-1)
 
         if feature_projector is not None:

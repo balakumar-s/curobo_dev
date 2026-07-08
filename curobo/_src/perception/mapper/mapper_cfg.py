@@ -24,6 +24,8 @@ import torch
 
 from curobo._src.perception.mapper.block_allocation import calculate_tsdf_max_blocks
 from curobo._src.perception.mapper.constants import (
+    _validate_color_grid_size,
+    _validate_feature_block_grid_size,
     _validate_feature_channels_per_thread,
     _validate_feature_grid_shape,
     _validate_feature_integration_kernel,
@@ -90,7 +92,7 @@ class MapperCfg:
     # === Block Storage ===
     #: Voxels per block edge. Supported values are 1 or powers of 2 in [2, 32]. See
     #: :class:`~curobo._src.perception.mapper.kernel.builder.builder_block_sparse_kernel.BlockSparseKernels`.
-    block_size: int = 4
+    block_size: int = 8
     # Target hash table active-entry fraction. 0.5 keeps probe chains short
     # enough that the average lookup cost stays low even after tombstone
     # accumulation from aggressive recycling. Lookup now probes the full
@@ -98,6 +100,8 @@ class MapperCfg:
     # safe from a correctness standpoint but costs probe time per lookup.
     hash_load_factor: float = 0.5
     roughness: float = 3.0
+    #: Number of RGBW control points per block edge.
+    color_grid_size: int = 1
 
     # === Integration ===
     seeding_method: str = "gather"
@@ -135,6 +139,17 @@ class MapperCfg:
     #: Camera image width in pixels. Required; see :attr:`image_height`.
     image_width: Optional[int] = None
 
+    # === Texture Cameras ===
+    #: Number of RGB cameras used by projective texture export. Defaults to
+    #: :attr:`num_cameras` when unset.
+    texture_num_cameras: Optional[int] = None
+    #: RGB texture camera image height in pixels. Defaults to
+    #: :attr:`image_height` when unset.
+    texture_camera_image_height: Optional[int] = None
+    #: RGB texture camera image width in pixels. Defaults to
+    #: :attr:`image_width` when unset.
+    texture_camera_image_width: Optional[int] = None
+
     # === LiDARs ===
     #: Number of batched LiDAR range images accepted by the optional LiDAR
     #: integrator. ``0`` disables LiDAR integration.
@@ -160,6 +175,9 @@ class MapperCfg:
     # === Per-block Features ===
     #: Per-block feature channel dimensionality. 0 disables features.
     feature_dim: int = 0
+    #: Number of feature control points per block edge. This is independent
+    #: from the incoming 2D feature image dimensions below.
+    feature_block_grid_size: int = 1
     #: Compile-time feature-grid height. Required when ``feature_dim > 0``;
     #: must be ``None`` when features are disabled.
     feature_grid_height: Optional[int] = None
@@ -190,8 +208,8 @@ class MapperCfg:
     #: Disabled by default to avoid profiling synchronizations in normal
     #: integration.
     profile_integration_kernel_timings: bool = False
-    #: Upper bound on per-block accumulator weight. Caps fp16
-    #: ``block_grid_rgb`` / ``block_features`` magnitudes each frame and sets
+    #: Upper bound on each RGB or feature-grid node's accumulator weight.
+    #: Caps fp16 ``block_grid_rgb`` / ``block_features`` magnitudes each frame and sets
     #: the EMA decay rate for old observations (effective window
     #: ``~W_max / mean_per_frame_weight``). Raise for longer memory,
     #: lower for faster adaptation to dynamic scenes.
@@ -242,11 +260,44 @@ class MapperCfg:
                 f"image_height and image_width must be positive, got "
                 f"image_height={self.image_height}, image_width={self.image_width}."
             )
+        if self.num_cameras <= 0:
+            log_and_raise(f"num_cameras must be positive, got num_cameras={self.num_cameras}.")
+        if (
+            self.texture_camera_image_height is None
+        ) != (self.texture_camera_image_width is None):
+            log_and_raise(
+                "texture_camera_image_height and texture_camera_image_width must be "
+                "specified together."
+            )
+        if self.texture_num_cameras is None:
+            self.texture_num_cameras = self.num_cameras
+        if self.texture_camera_image_height is None:
+            self.texture_camera_image_height = self.image_height
+            self.texture_camera_image_width = self.image_width
+        if self.texture_num_cameras <= 0:
+            log_and_raise(
+                "texture_num_cameras must be positive, got "
+                f"texture_num_cameras={self.texture_num_cameras}."
+            )
+        if (
+            self.texture_camera_image_height <= 0
+            or self.texture_camera_image_width <= 0
+        ):
+            log_and_raise(
+                "texture_camera_image_height and texture_camera_image_width must be "
+                "positive, got "
+                f"{self.texture_camera_image_height}x{self.texture_camera_image_width}."
+            )
         _validate_feature_channels_per_thread(self.feature_channels_per_thread)
         _validate_feature_grid_shape(
             self.feature_dim,
             self.feature_grid_height,
             self.feature_grid_width,
+        )
+        _validate_color_grid_size(self.color_grid_size, self.block_size)
+        _validate_feature_block_grid_size(
+            self.feature_block_grid_size,
+            self.block_size,
         )
         _validate_lidar_config(
             self.lidar_num_sensors,

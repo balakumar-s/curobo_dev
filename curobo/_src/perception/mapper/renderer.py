@@ -34,6 +34,7 @@ import torch
 import warp as wp
 
 from curobo._src.types.pose import Pose
+from curobo._src.util.logging import log_and_raise
 
 
 @dataclass
@@ -47,15 +48,22 @@ class BlockSparseTSDFRendererCfg:
             Since weight = 1/depth² (clamped to [0.001, 2.0]), this can be interpreted
             as the number of observations at 1m depth. E.g., 0.5 = half an observation
             at 1m, or one observation at ~1.4m, or two observations at 2m.
-        use_block_acceleration: If True, use block-level skipping to accelerate
-            raymarching. This skips unallocated blocks entirely, providing 5-50x
-            speedup depending on scene sparsity. Default True.
     """
 
     depth_minimum_distance: float = 0.2
     depth_maximum_distance: float = 15.0
     minimum_tsdf_weight: float = 0.2
-    use_block_acceleration: bool = True
+
+
+@dataclass(frozen=True)
+class _RenderInputs:
+    """Normalized batched camera inputs for renderer kernels."""
+
+    intrinsics: torch.Tensor
+    positions: torch.Tensor
+    quaternions: torch.Tensor
+    camera_count: int
+    single_camera: bool
 
 
 class BlockSparseTSDFRenderer:
@@ -77,24 +85,22 @@ class BlockSparseTSDFRenderer:
     def __init__(
         self,
         integrator,  # BlockSparseESDFIntegrator or BlockSparseTSDFIntegrator
-        use_block_acceleration: bool = True,
-    ):
+    ) -> None:
         """Initialize BlockSparseTSDFRenderer.
 
         Args:
             integrator: Integrator instance with block-sparse TSDF.
-            use_block_acceleration: If True, use block-level skipping for faster
-                raymarching. This skips unallocated blocks entirely, providing
-                significant speedup for sparse scenes. Default True.
         """
         self.integrator = integrator
         self.config = BlockSparseTSDFRendererCfg(
             depth_minimum_distance=integrator.config.depth_minimum_distance,
             depth_maximum_distance=integrator.config.depth_maximum_distance,
             minimum_tsdf_weight=integrator.config.minimum_tsdf_weight,
-            use_block_acceleration=use_block_acceleration,
         )
-        self.device = integrator.device
+        if hasattr(integrator, "device"):
+            self.device = integrator.device
+        else:
+            self.device = integrator._tsdf.device
 
         # Pre-allocated buffers
         self._buffer_size = 0
@@ -104,47 +110,93 @@ class BlockSparseTSDFRenderer:
         self._hit_depths = None
         self._hit_mask = None
 
-        # Camera parameter buffers
-        self.cam_position = torch.zeros(3, dtype=torch.float32, device=self.device)
-        self.cam_quaternion = torch.zeros(4, dtype=torch.float32, device=self.device)
-        self.intrinsics_matrix = torch.zeros((3, 3), dtype=torch.float32, device=self.device)
-
-    def _ensure_buffers(self, n_pixels: int):
+    def _ensure_buffers(self, n_pixels: int, include_color: bool = False) -> None:
         """Ensure output buffers are large enough."""
-        if self._buffer_size >= n_pixels:
+        if self._buffer_size < n_pixels:
+            self._hit_points = torch.zeros((n_pixels, 3), dtype=torch.float32, device=self.device)
+            self._hit_normals = torch.zeros((n_pixels, 3), dtype=torch.float32, device=self.device)
+            self._hit_depths = torch.zeros(n_pixels, dtype=torch.float32, device=self.device)
+            self._hit_mask = torch.zeros(n_pixels, dtype=torch.uint8, device=self.device)
+            self._hit_colors = None
+            self._buffer_size = n_pixels
+        if not include_color:
             return
+        if self._hit_colors is None or self._hit_colors.shape[0] < n_pixels:
+            self._hit_colors = torch.zeros((n_pixels, 3), dtype=torch.uint8, device=self.device)
 
-        self._hit_points = torch.zeros((n_pixels, 3), dtype=torch.float32, device=self.device)
-        self._hit_normals = torch.zeros((n_pixels, 3), dtype=torch.float32, device=self.device)
-        self._hit_colors = torch.zeros((n_pixels, 3), dtype=torch.uint8, device=self.device)
-        self._hit_depths = torch.zeros(n_pixels, dtype=torch.float32, device=self.device)
-        self._hit_mask = torch.zeros(n_pixels, dtype=torch.uint8, device=self.device)
-        self._buffer_size = n_pixels
-
-    def _extract_pose(self, pose: Pose):
-        """Extract position and quaternion from Pose.
-
-        Args:
-            pose: Camera-to-world transform as Pose.
-        """
-        position = pose.position.squeeze().to(self.device, dtype=torch.float32)
-        quaternion = pose.quaternion.squeeze().to(self.device, dtype=torch.float32)
-        self.cam_position.copy_(position)
-        self.cam_quaternion.copy_(quaternion)
-
-    def _extract_intrinsics(self, intrinsics: torch.Tensor):
-        """Extract intrinsics matrix."""
+    def _normalize_intrinsics(self, intrinsics: torch.Tensor) -> tuple[torch.Tensor, bool]:
+        """Return camera intrinsics as ``(N, 3, 3)`` and whether input was batched."""
+        intrinsics_was_batched = (
+            (intrinsics.ndim == 2 and intrinsics.shape != (3, 3)) or intrinsics.ndim == 3
+        )
         intrinsics = intrinsics.to(self.device, dtype=torch.float32)
-        if intrinsics.dim() == 2:
-            self.intrinsics_matrix.copy_(intrinsics[:3, :3])
-        else:
-            # [fx, fy, cx, cy] format
-            fx, fy, cx, cy = intrinsics[:4].tolist()
-            self.intrinsics_matrix.zero_()
-            self.intrinsics_matrix[0, 0] = fx
-            self.intrinsics_matrix[1, 1] = fy
-            self.intrinsics_matrix[0, 2] = cx
-            self.intrinsics_matrix[1, 2] = cy
+        if intrinsics.ndim == 1 and intrinsics.shape[0] == 4:
+            out = torch.zeros((1, 3, 3), dtype=torch.float32, device=self.device)
+            out[0, 0, 0] = intrinsics[0]
+            out[0, 1, 1] = intrinsics[1]
+            out[0, 0, 2] = intrinsics[2]
+            out[0, 1, 2] = intrinsics[3]
+            out[0, 2, 2] = 1.0
+            return out, intrinsics_was_batched
+        if intrinsics.ndim == 2 and intrinsics.shape == (3, 3):
+            return intrinsics.unsqueeze(0).contiguous(), intrinsics_was_batched
+        if intrinsics.ndim == 2 and intrinsics.shape[1] == 4:
+            out = torch.zeros(
+                (intrinsics.shape[0], 3, 3), dtype=torch.float32, device=self.device
+            )
+            out[:, 0, 0] = intrinsics[:, 0]
+            out[:, 1, 1] = intrinsics[:, 1]
+            out[:, 0, 2] = intrinsics[:, 2]
+            out[:, 1, 2] = intrinsics[:, 3]
+            out[:, 2, 2] = 1.0
+            return out, intrinsics_was_batched
+        if intrinsics.ndim == 3 and intrinsics.shape[1:] == (3, 3):
+            return intrinsics.contiguous(), intrinsics_was_batched
+        log_and_raise(
+            "intrinsics must have shape (3, 3), (4,), (N, 3, 3), or (N, 4)."
+        )
+
+    def _normalize_render_inputs(
+        self,
+        intrinsics: torch.Tensor,
+        pose: Pose,
+    ) -> _RenderInputs:
+        """Normalize render inputs with exact camera-count matching."""
+        if pose.position is None or pose.quaternion is None:
+            log_and_raise("pose must contain position and quaternion tensors.")
+
+        intrinsics_matrix, intrinsics_was_batched = self._normalize_intrinsics(intrinsics)
+        positions = pose.position.to(self.device, dtype=torch.float32)
+        quaternions = pose.quaternion.to(self.device, dtype=torch.float32)
+
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            log_and_raise(f"pose.position must have shape (N, 3), got {positions.shape}.")
+        if quaternions.ndim != 2 or quaternions.shape[1] != 4:
+            log_and_raise(
+                f"pose.quaternion must have shape (N, 4), got {quaternions.shape}."
+            )
+        if positions.shape[0] != quaternions.shape[0]:
+            log_and_raise(
+                "pose.position and pose.quaternion must have the same camera count, "
+                f"got {positions.shape[0]} and {quaternions.shape[0]}."
+            )
+
+        camera_count = positions.shape[0]
+        if intrinsics_matrix.shape[0] != camera_count:
+            log_and_raise(
+                "intrinsics and pose must have the same camera count; "
+                f"got {intrinsics_matrix.shape[0]} and {camera_count}."
+            )
+        if camera_count <= 0:
+            log_and_raise("render camera count must be positive.")
+
+        return _RenderInputs(
+            intrinsics=intrinsics_matrix.contiguous(),
+            positions=positions.contiguous(),
+            quaternions=quaternions.contiguous(),
+            camera_count=camera_count,
+            single_camera=camera_count == 1 and not intrinsics_was_batched,
+        )
 
     def render(
         self,
@@ -155,42 +207,36 @@ class BlockSparseTSDFRenderer:
         """Render depth and normal images from block-sparse TSDF.
 
         Args:
-            intrinsics: [3, 3] or [4] camera intrinsics (fx, fy, cx, cy).
-            pose: Camera-to-world transform as Pose.
+            intrinsics: ``(3, 3)``, ``(4,)``, ``(N, 3, 3)``, or ``(N, 4)`` camera
+                intrinsics. Batched intrinsics require a pose with the same camera count.
+            pose: Camera-to-world transform as :class:`Pose`.
             image_shape: (H, W) output image dimensions.
 
         Returns:
-            depth_image: [H, W] rendered depth in meters (0 where no hit).
-            normal_image: [H, W, 3] surface normals in world frame.
-            valid_mask: [H, W] boolean mask of valid pixels.
+            Tuple of depth, normals, and valid mask. Single-camera inputs return
+            ``(H, W)``, ``(H, W, 3)``, and ``(H, W)``. Batched inputs return
+            ``(N, H, W)``, ``(N, H, W, 3)``, and ``(N, H, W)``.
         """
         H, W = image_shape
-        n_pixels = H * W
+        render_inputs = self._normalize_render_inputs(intrinsics, pose)
+        n_pixels_per_camera = H * W
+        n_pixels = render_inputs.camera_count * n_pixels_per_camera
 
         self._ensure_buffers(n_pixels)
-        self._extract_pose(pose)
-        self._extract_intrinsics(intrinsics)
 
         # Get block-sparse TSDF data and per-instance kernel specialization.
         tsdf = self.integrator._tsdf
         warp_data = tsdf.get_warp_data()
         kernels = tsdf.kernels
 
-        # Select kernel based on acceleration setting
-        kernel = (
-            kernels.raycast_block_sparse_accelerated_kernel
-            if self.config.use_block_acceleration
-            else kernels.raycast_block_sparse_kernel
-        )
-
         # Launch raycast kernel with struct-based API
         wp.launch(
-            kernel=kernel,
+            kernel=kernels.raycast_block_sparse_kernel,
             dim=n_pixels,
             inputs=[
-                wp.from_torch(self.intrinsics_matrix, dtype=wp.float32),
-                wp.from_torch(self.cam_position, dtype=wp.float32),
-                wp.from_torch(self.cam_quaternion, dtype=wp.float32),
+                wp.from_torch(render_inputs.intrinsics, dtype=wp.float32),
+                wp.from_torch(render_inputs.positions, dtype=wp.float32),
+                wp.from_torch(render_inputs.quaternions, dtype=wp.float32),
                 warp_data,
                 self.config.depth_minimum_distance,
                 self.config.depth_maximum_distance,
@@ -201,14 +247,24 @@ class BlockSparseTSDFRenderer:
                 wp.from_torch(self._hit_mask[:n_pixels], dtype=wp.uint8),
                 H,
                 W,
+                n_pixels_per_camera,
             ],
         )
 
         # Kernel clears hit_* to zero on miss, so output buffers are
         # authoritative and no additional masking is required here.
-        depth_image = self._hit_depths[:n_pixels].view(H, W)
-        normal_image = self._hit_normals[:n_pixels].view(H, W, 3)
-        valid_mask = self._hit_mask[:n_pixels].view(H, W).bool()
+        if render_inputs.single_camera:
+            depth_image = self._hit_depths[:n_pixels].view(H, W)
+            normal_image = self._hit_normals[:n_pixels].view(H, W, 3)
+            valid_mask = self._hit_mask[:n_pixels].view(H, W).bool()
+        else:
+            depth_image = self._hit_depths[:n_pixels].view(render_inputs.camera_count, H, W)
+            normal_image = self._hit_normals[:n_pixels].view(
+                render_inputs.camera_count, H, W, 3
+            )
+            valid_mask = self._hit_mask[:n_pixels].view(
+                render_inputs.camera_count, H, W
+            ).bool()
 
         return depth_image, normal_image, valid_mask
 
@@ -221,43 +277,36 @@ class BlockSparseTSDFRenderer:
         """Render depth, normals, and color from block-sparse TSDF.
 
         Args:
-            intrinsics: [3, 3] or [4] camera intrinsics.
-            pose: Camera-to-world transform as Pose.
+            intrinsics: ``(3, 3)``, ``(4,)``, ``(N, 3, 3)``, or ``(N, 4)`` camera
+                intrinsics. Batched intrinsics require a pose with the same camera count.
+            pose: Camera-to-world transform as :class:`Pose`.
             image_shape: (H, W) output dimensions.
 
         Returns:
-            depth_image: [H, W] rendered depth in meters.
-            normal_image: [H, W, 3] surface normals.
-            color_image: [H, W, 3] uint8 RGB colors.
-            valid_mask: [H, W] boolean mask.
+            Tuple of depth, normals, color, and valid mask. Single-camera inputs
+            keep the existing ``(H, W)`` and ``(H, W, 3)`` shapes; batched inputs
+            include a leading camera dimension.
         """
         H, W = image_shape
-        n_pixels = H * W
+        render_inputs = self._normalize_render_inputs(intrinsics, pose)
+        n_pixels_per_camera = H * W
+        n_pixels = render_inputs.camera_count * n_pixels_per_camera
 
-        self._ensure_buffers(n_pixels)
-        self._extract_pose(pose)
-        self._extract_intrinsics(intrinsics)
+        self._ensure_buffers(n_pixels, include_color=True)
 
         # Get block-sparse TSDF data and per-instance kernel specialization.
         tsdf = self.integrator._tsdf
         warp_data = tsdf.get_warp_data()
         kernels = tsdf.kernels
 
-        # Select kernel based on acceleration setting
-        kernel = (
-            kernels.raycast_block_sparse_accelerated_color_kernel
-            if self.config.use_block_acceleration
-            else kernels.raycast_block_sparse_color_kernel
-        )
-
         # Launch color raycast kernel with struct-based API
         wp.launch(
-            kernel=kernel,
+            kernel=kernels.raycast_block_sparse_color_kernel,
             dim=n_pixels,
             inputs=[
-                wp.from_torch(self.intrinsics_matrix, dtype=wp.float32),
-                wp.from_torch(self.cam_position, dtype=wp.float32),
-                wp.from_torch(self.cam_quaternion, dtype=wp.float32),
+                wp.from_torch(render_inputs.intrinsics, dtype=wp.float32),
+                wp.from_torch(render_inputs.positions, dtype=wp.float32),
+                wp.from_torch(render_inputs.quaternions, dtype=wp.float32),
                 warp_data,
                 self.config.depth_minimum_distance,
                 self.config.depth_maximum_distance,
@@ -269,15 +318,28 @@ class BlockSparseTSDFRenderer:
                 wp.from_torch(self._hit_mask[:n_pixels], dtype=wp.uint8),
                 H,
                 W,
+                n_pixels_per_camera,
             ],
         )
 
         # Kernel clears hit_* to zero on miss, so output buffers are
         # authoritative and no additional masking is required here.
-        depth_image = self._hit_depths[:n_pixels].view(H, W)
-        normal_image = self._hit_normals[:n_pixels].view(H, W, 3)
-        color_image = self._hit_colors[:n_pixels].view(H, W, 3)
-        valid_mask = self._hit_mask[:n_pixels].view(H, W).bool()
+        if render_inputs.single_camera:
+            depth_image = self._hit_depths[:n_pixels].view(H, W)
+            normal_image = self._hit_normals[:n_pixels].view(H, W, 3)
+            color_image = self._hit_colors[:n_pixels].view(H, W, 3)
+            valid_mask = self._hit_mask[:n_pixels].view(H, W).bool()
+        else:
+            depth_image = self._hit_depths[:n_pixels].view(render_inputs.camera_count, H, W)
+            normal_image = self._hit_normals[:n_pixels].view(
+                render_inputs.camera_count, H, W, 3
+            )
+            color_image = self._hit_colors[:n_pixels].view(
+                render_inputs.camera_count, H, W, 3
+            )
+            valid_mask = self._hit_mask[:n_pixels].view(
+                render_inputs.camera_count, H, W
+            ).bool()
 
         return depth_image, normal_image, color_image, valid_mask
 
@@ -295,7 +357,7 @@ class BlockSparseTSDFRenderer:
             image_shape: (H, W) output dimensions.
 
         Returns:
-            depth_image: [H, W] rendered depth in meters.
+            depth_image: ``(H, W)`` or ``(N, H, W)`` rendered depth in meters.
         """
         depth, _, _ = self.render(intrinsics, pose, image_shape)
         return depth
@@ -314,7 +376,7 @@ class BlockSparseTSDFRenderer:
             image_shape: (H, W) output dimensions.
 
         Returns:
-            normal_image: [H, W, 3] surface normals.
+            normal_image: ``(H, W, 3)`` or ``(N, H, W, 3)`` surface normals.
         """
         _, normals, _ = self.render(intrinsics, pose, image_shape)
         return normals
@@ -333,7 +395,7 @@ class BlockSparseTSDFRenderer:
             image_shape: (H, W) output dimensions.
 
         Returns:
-            color_image: [H, W, 3] uint8 RGB colors.
+            color_image: ``(H, W, 3)`` or ``(N, H, W, 3)`` uint8 RGB colors.
         """
         _, _, color, _ = self.render_color(intrinsics, pose, image_shape)
         # Kernel already writes 0 for invalid pixels (see render_color).
@@ -353,10 +415,15 @@ class BlockSparseTSDFRenderer:
             image_shape: (H, W) output dimensions.
 
         Returns:
-            color_image: [H, W, 3] uint8 RGB colormap.
+            color_image: ``(H, W, 3)`` or ``(N, H, W, 3)`` uint8 RGB colormap.
         """
         depth, _, valid = self.render(intrinsics, pose, image_shape)
-        return depth_to_colormap(depth, self.config.depth_minimum_distance, self.config.depth_maximum_distance, valid)
+        return depth_to_colormap(
+            depth,
+            self.config.depth_minimum_distance,
+            self.config.depth_maximum_distance,
+            valid,
+        )
 
     def render_normal_colormap(
         self,
@@ -372,7 +439,7 @@ class BlockSparseTSDFRenderer:
             image_shape: (H, W) output dimensions.
 
         Returns:
-            color_image: [H, W, 3] uint8 RGB colormap.
+            color_image: ``(H, W, 3)`` or ``(N, H, W, 3)`` uint8 RGB colormap.
         """
         _, normals, valid = self.render(intrinsics, pose, image_shape)
         return normals_to_colormap(normals, valid)
@@ -397,23 +464,29 @@ class BlockSparseTSDFRenderer:
             use_color: If True, use TSDF color. If False, use gray.
 
         Returns:
-            shaded_image: [H, W, 3] uint8 RGB shaded image.
+            shaded_image: ``(H, W, 3)`` or ``(N, H, W, 3)`` uint8 RGB shaded image.
         """
         if use_color:
             _, normals, colors, valid = self.render_color(intrinsics, pose, image_shape)
             base_color = colors.float() / 255.0
         else:
             _, normals, valid = self.render(intrinsics, pose, image_shape)
-            base_color = torch.ones(*normals.shape[:-1], 3, device=self.device)
+            base_color = torch.ones_like(normals)
 
         # Transform light to world frame and normalize
-        R = pose.get_rotation_matrix().squeeze().to(self.device, dtype=torch.float32)
+        R = pose.get_rotation_matrix().to(self.device, dtype=torch.float32)
         light_cam = torch.tensor(light_direction, device=self.device, dtype=torch.float32)
-        light_world = R @ light_cam
-        light_world = light_world / light_world.norm()
+        if normals.ndim == 4:
+            light_world = torch.matmul(R, light_cam.view(1, 3, 1)).squeeze(-1)
+            light_world = light_world / light_world.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            light_view = light_world.view(light_world.shape[0], 1, 1, 3)
+        else:
+            light_world = R[0] @ light_cam
+            light_world = light_world / light_world.norm().clamp_min(1e-6)
+            light_view = light_world.view(1, 1, 3)
 
         # Lambertian shading: max(0, n · l)
-        n_dot_l = (normals * light_world.view(1, 1, 3)).sum(dim=-1)
+        n_dot_l = (normals * light_view).sum(dim=-1)
         shading = torch.clamp(n_dot_l, 0, 1)
 
         # Apply ambient + diffuse
@@ -458,7 +531,9 @@ def depth_to_colormap(
         valid_mask = depth > 0
 
     # Normalize depth to [0, 1]
-    depth_normalized = (depth - depth_minimum_distance) / (depth_maximum_distance - depth_minimum_distance)
+    depth_normalized = (depth - depth_minimum_distance) / (
+        depth_maximum_distance - depth_minimum_distance
+    )
     depth_normalized = torch.clamp(depth_normalized, 0, 1)
 
     t = depth_normalized
