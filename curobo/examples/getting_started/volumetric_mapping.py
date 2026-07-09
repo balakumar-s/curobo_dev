@@ -686,9 +686,7 @@ def main():
     print("\nExtracting mesh...")
     output_path = Path(args.output)
     output_suffix = output_path.suffix.lower()
-    use_textured_mesh = (
-        len(texture_observations) > 0 and output_suffix in {".glb", ".obj"}
-    )
+    use_textured_mesh = False
     if use_textured_mesh:
         print(
             "Using "
