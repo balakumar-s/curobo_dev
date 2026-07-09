@@ -24,8 +24,8 @@ class KinematicsCfg:
     """Configuration for robot kinematics on GPU.
 
     Helper functions are provided to load this configuration from an URDF file or from
-    a cuRobo robot configuration file (:ref:`tut_robot_configuration`). To create from a XRDF, use
-    :ref:`curobo.util.xrdf_utils.convert_xrdf_to_curobo`.
+    a cuRobo robot configuration file (:ref:`tutorial_build_robot_model`). YAML and XRDF files
+    can be loaded with :meth:`~curobo.kinematics.KinematicsCfg.from_robot_yaml_file`.
     """
 
     #: Device and floating point precision to use for kinematics.
@@ -125,7 +125,9 @@ class KinematicsCfg:
         urdf_path: Optional[str] = None,
         **kwargs: Any,
     ) -> KinematicsCfg:
-        """Load robot from a yaml file that is in cuRobo's format (:ref:`tut_robot_configuration`).
+        """Load a robot from a cuRobo YAML or XRDF file.
+
+        See :ref:`tutorial_build_robot_model` for the configuration workflow.
 
         Args:
             file_path: Path to robot configuration file (yml or xrdf).
@@ -159,7 +161,9 @@ class KinematicsCfg:
         device_cfg: DeviceCfg = DeviceCfg(),
         urdf_path: Optional[str] = None,
     ) -> KinematicsCfg:
-        """Load robot from a yaml file that is in cuRobo's format (:ref:`tut_robot_configuration`).
+        """Load a robot from a cuRobo YAML or XRDF file.
+
+        See :ref:`tutorial_build_robot_model` for the configuration workflow.
 
         Args:
             file_path: Path to robot configuration file (yml or xrdf).
@@ -190,7 +194,7 @@ class KinematicsCfg:
     ) -> KinematicsCfg:
         """Load robot from a dictionary containing data for :class:`~curobo.cuda_robot_model.cuda_robot_generator.KinematicsLoaderCfg`.
 
-        :tut_robot_configuration discusses the data required to load a robot.
+        See :ref:`tutorial_build_robot_model` for the data required to load a robot.
 
         Args:
             data_dict: Input dictionary containing robot configuration.

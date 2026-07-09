@@ -22,7 +22,7 @@ from curobo._src.util_file import write_yaml
 class RobotCfg:
     """Robot configuration to load in CuRobo.
 
-    Tutorial: :ref:`tut_robot_configuration`
+    Tutorial: :ref:`tutorial_build_robot_model`
     """
 
     #: Robot kinematics configuration to load into cuda robot model.

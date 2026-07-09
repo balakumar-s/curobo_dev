@@ -23,6 +23,29 @@ manipulators to high-DoF humanoids.
 .. raw:: html
 
    <figure>
+   <video autoplay loop muted playsinline controls preload="auto" width="100%">
+     <source src="videos/dynamic_franka.webm" type="video/webm">
+   </video>
+   <figcaption>cuRobo integrates depth from a depth camera into a TSDF map, generates ESDF, and enables collision-free motions.</figcaption>
+   </figure>
+
+
+
+.. raw:: html
+
+   <figure>
+   <video autoplay loop muted playsinline controls preload="auto" width="100%">
+     <source src="videos/ur10_real_timer.webm" type="video/webm">
+   </video>
+   <figcaption>cuRobo generating collision-free motions on a NVIDIA Jetson ORIN.</figcaption>
+   </figure>
+
+
+
+
+.. raw:: html
+
+   <figure>
    <video autoplay loop muted playsinline preload="auto" width="100%">
      <source src="videos/humanoid_run.webm" type="video/webm">
    </video>

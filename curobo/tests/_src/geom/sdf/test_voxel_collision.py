@@ -88,7 +88,9 @@ def _test_sdf_with_grad_kernel(
     if tid >= query_points.shape[0]:
         return
     local_pt = query_points[tid]
-    result = _test_compute_local_sdf_with_grad(obs_set, env_idx, obs_local_idx, local_pt)
+    result = _test_compute_local_sdf_with_grad(
+        obs_set, env_idx, obs_local_idx, local_pt, wp.float32(0.0)
+    )
     out_sdf[tid] = result[0]
 
 
@@ -103,8 +105,8 @@ def _test_both_sdf_kernel(
 ):
     """Kernel that calls BOTH compute_local_sdf and compute_local_sdf_with_grad.
 
-    Reproduces the pattern used in the sweep kernel where both are called
-    for the same point.
+    Reproduces the historical mixed-overload sweep pattern where both are
+    called for the same point.
     """
     tid = wp.tid()
     if tid >= query_points.shape[0]:
@@ -115,7 +117,9 @@ def _test_both_sdf_kernel(
     out_sdf_only[tid] = sdf
 
     if sdf < 0.0:
-        result = _test_compute_local_sdf_with_grad(obs_set, env_idx, obs_local_idx, local_pt)
+        result = _test_compute_local_sdf_with_grad(
+            obs_set, env_idx, obs_local_idx, local_pt, wp.float32(0.0)
+        )
         out_sdf_grad[tid] = result[0]
 
 
@@ -137,7 +141,10 @@ def _test_sweep_pattern_kernel(
 
     local_pt = query_points[tid]
 
-    result = _test_compute_local_sdf_with_grad(obs_set, env_idx, obs_local_idx, local_pt)
+    radius_adjusted = wp.float32(0.01)
+    result = _test_compute_local_sdf_with_grad(
+        obs_set, env_idx, obs_local_idx, local_pt, radius_adjusted
+    )
     sdf_current = result[0]
 
     cost_sum = wp.float32(0.0)
@@ -151,14 +158,16 @@ def _test_sweep_pattern_kernel(
         interp_pt = t * local_pt
 
         sdf = _test_compute_local_sdf(obs_set, env_idx, obs_local_idx, interp_pt)
-        penetration = -sdf + 0.01
+        penetration = -sdf + radius_adjusted
 
         if penetration > 0.0:
-            sdf_result = _test_compute_local_sdf_with_grad(obs_set, env_idx, obs_local_idx, interp_pt)
+            sdf_result = _test_compute_local_sdf_with_grad(
+                obs_set, env_idx, obs_local_idx, interp_pt, radius_adjusted
+            )
             cost_sum += penetration
             jump += penetration
         else:
-            jump += wp.max(-penetration, 0.01)
+            jump += wp.max(-penetration, radius_adjusted)
 
     out_sdf[tid] = cost_sum
 
@@ -187,7 +196,10 @@ def _test_dual_sweep_kernel(
     local_prev = prev_points[tid]
     local_next = next_points[tid]
 
-    inv_t = _test_load_obstacle_transform(obs_set, env_idx, obs_local_idx)
+    # Repeated SDF calls require a local struct copy, matching the production
+    # sweep kernel and avoiding invalid parameter-to-local pointer conversion.
+    obs = obs_set
+    inv_t = _test_load_obstacle_transform(obs, env_idx, obs_local_idx)
 
     radius_adjusted = wp.float32(0.02)
     eta = wp.float32(0.02)
@@ -195,7 +207,9 @@ def _test_dual_sweep_kernel(
     cost_sum = wp.float32(0.0)
     grad_sum_local = wp.vec3(0.0, 0.0, 0.0)
 
-    sdf_result = _test_compute_local_sdf_with_grad(obs_set, env_idx, obs_local_idx, local_current)
+    sdf_result = _test_compute_local_sdf_with_grad(
+        obs, env_idx, obs_local_idx, local_current, radius_adjusted
+    )
     penetration = -sdf_result[0] + radius_adjusted
 
     if penetration > 0.0:
@@ -212,7 +226,9 @@ def _test_dual_sweep_kernel(
         t = 1.0 - 0.5 * jump * inv_half_dist
         local_pt = t * local_current + (1.0 - t) * local_prev
 
-        sdf_result = _test_compute_local_sdf_with_grad(obs_set, env_idx, obs_local_idx, local_pt)
+        sdf_result = _test_compute_local_sdf_with_grad(
+            obs, env_idx, obs_local_idx, local_pt, radius_adjusted
+        )
         penetration = -sdf_result[0] + radius_adjusted
 
         if penetration > 0.0:
@@ -235,7 +251,9 @@ def _test_dual_sweep_kernel(
         t = 1.0 - 0.5 * jump * inv_half_dist
         local_pt = t * local_current + (1.0 - t) * local_next
 
-        sdf_result = _test_compute_local_sdf_with_grad(obs_set, env_idx, obs_local_idx, local_pt)
+        sdf_result = _test_compute_local_sdf_with_grad(
+            obs, env_idx, obs_local_idx, local_pt, radius_adjusted
+        )
         penetration = -sdf_result[0] + radius_adjusted
 
         if penetration > 0.0:
@@ -267,10 +285,10 @@ def _test_full_sweep_kernel(
     max_n_obs: wp.int32,
     use_multi_env: wp.uint8,
 ):
-    """Exact replica of swept_sphere_obstacle_collision_kernel using compute_local_sdf.
+    """Reproduce the historical mixed-overload swept-collision pattern.
 
-    Identical signature, identical logic, identical function calls.
-    Only difference: registered in test module instead of sweep kernel module.
+    Kept to exercise codegen when compute_local_sdf and
+    compute_local_sdf_with_grad appear in one kernel.
     """
     tid = wp.tid()
 
@@ -306,7 +324,9 @@ def _test_full_sweep_kernel(
 
     local_current = wp.transform_point(inv_t, query.center)
 
-    sdf_result = _test_compute_local_sdf_with_grad(obs_set, env_idx, obs_local_idx, local_current)
+    sdf_result = _test_compute_local_sdf_with_grad(
+        obs_set, env_idx, obs_local_idx, local_current, radius_adjusted
+    )
     penetration = -sdf_result[0] + radius_adjusted
 
     if penetration > 0.0:
@@ -332,7 +352,9 @@ def _test_full_sweep_kernel(
             penetration = -sdf + radius_adjusted
 
             if penetration > 0.0:
-                sdf_result = _test_compute_local_sdf_with_grad(obs_set, env_idx, obs_local_idx, local_pt)
+                sdf_result = _test_compute_local_sdf_with_grad(
+                    obs_set, env_idx, obs_local_idx, local_pt, radius_adjusted
+                )
                 activation_result = apply_collision_activation(penetration, eta)
                 cost_sum += activation_result[0]
                 grad_sum_local += activation_result[1] * wp.vec3(sdf_result[1], sdf_result[2], sdf_result[3])
@@ -361,7 +383,9 @@ def _test_full_sweep_kernel(
             penetration = -sdf + radius_adjusted
 
             if penetration > 0.0:
-                sdf_result = _test_compute_local_sdf_with_grad(obs_set, env_idx, obs_local_idx, local_pt)
+                sdf_result = _test_compute_local_sdf_with_grad(
+                    obs_set, env_idx, obs_local_idx, local_pt, radius_adjusted
+                )
                 activation_result = apply_collision_activation(penetration, eta)
                 cost_sum += activation_result[0]
                 grad_sum_local += activation_result[1] * wp.vec3(sdf_result[1], sdf_result[2], sdf_result[3])

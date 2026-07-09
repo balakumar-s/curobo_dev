@@ -39,7 +39,7 @@ class Kinematics:
     """CUDA Accelerated Robot Model
 
     Load basic kinematics from an URDF with :func:`~KinematicsCfg.from_basic_urdf`.
-    Check :ref:`tut_robot_configuration` for details on how to also create a geometric
+    Check :ref:`tutorial_build_robot_model` for details on how to also create a geometric
     representation of the robot.
     Currently dof is created only for links that we need to compute kinematics. E.g., for robots
     with many serial chains, add all links of the robot to get the correct dof. This is not an
