@@ -56,7 +56,8 @@ Step 2: Run the tutorial
 Add ``--visualize`` to inspect the fitted spheres in a
 `Viser <https://viser.studio>`_ viewer at ``http://localhost:8080``.
 ``--clip-link panda_link0 z 0.0`` keeps the base link's spheres from
-protruding below the mounting surface (see :ref:`Step 5 <step5_tuning>`).
+protruding below the mounting surface (see
+:ref:`Step 5 <getting-started/build_robot_model:step 5: tuning (advanced)>`).
 
 Step 3: Check the output
 --------------------------

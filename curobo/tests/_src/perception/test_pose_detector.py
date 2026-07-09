@@ -311,15 +311,22 @@ class TestICPWithSyntheticData:
         observed_points = (R_gt @ mesh_points.T).T + t_gt
         observed_points += torch.randn_like(observed_points) * 0.001  # 1mm noise
 
-        # Start from approximate initial guess
+        # Start from a fixed initial guess inside the fine correspondence threshold.
         T_init = torch.eye(4, device=cuda_device_cfg.device, dtype=cuda_device_cfg.dtype)
-        T_init[:3, 3] = t_gt + torch.randn(3, device=cuda_device_cfg.device) * 0.02  # 20mm offset
+        initial_offset = torch.tensor(
+            [0.01, -0.01, 0.01],
+            device=cuda_device_cfg.device,
+            dtype=cuda_device_cfg.dtype,
+        )
+        T_init[:3, 3] = t_gt + initial_offset
 
         # Run fine ICP
         T_result, error, num_iters, history = detector._icp_fine(T_init, observed_points, config)
 
         # Should refine to reasonable error
         assert error < 0.03  # Less than 30mm (fine refinement with initial offset)
+        translation_error = torch.norm(T_result[:3, 3] - t_gt).item()
+        assert translation_error < 0.005  # Less than 5mm translation error
         assert num_iters > 0
         assert T_result.shape == (4, 4)
 
@@ -565,4 +572,3 @@ class TestEdgeCases:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

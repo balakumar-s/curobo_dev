@@ -1,6 +1,10 @@
 
 Updates
 =======
+- July 9, 2026: Add visibility-tested textured mapper outputs, independent RGB and
+  neural-feature resolutions, and faster TSDF mesh extraction for real-time visualization.
+- June 15, 2026: Add LiDAR TSDF, RGB, and feature fusion, compact mapper block
+  checkpointing, and live RealSense RGB-D mapping with MPC.
 - April 27, 2026: Add feature channel integration in TSDF mapper, improve TSDF mapper performance (1.5ms to 0.5ms).
 - April 2026 (v0.8.0): cuRoboV2, complete rewrite of cuRobo with new features and improvements.
 - 2024 (v0.7.x): Sub-millimetre IK precision, mimic joints, ESDF voxel collision checker, Grasp API planning, trajectory re-timing.
