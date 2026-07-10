@@ -84,6 +84,15 @@ class TestIKSolverCfgCreate:
         assert isinstance(config, IKSolverCfg)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_create_default_num_seeds(self, cuda_device_cfg) -> None:
+        """Test the default IK seed count."""
+        config = IKSolverCfg.create(
+            robot="franka.yml",
+            device_cfg=cuda_device_cfg,
+        )
+        assert config.num_seeds == 32
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_create_with_dict_robot_yaml(self, cuda_device_cfg, franka_robot_cfg_dict):
         """Test create with dict robot config."""
         config = IKSolverCfg.create(
@@ -304,4 +313,3 @@ class TestIKSolverCfgCustomOptimizerYamls:
             optimizer_configs=["ik/particle_ik.yml", "ik/lbfgs_ik.yml"],
         )
         assert len(config.optimizer_configs) == 2
-

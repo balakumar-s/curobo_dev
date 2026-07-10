@@ -241,6 +241,7 @@ class CuboidData:
         if num_cuboids == 0:
             self.enable[env_idx, :] = 0
             self.count[env_idx] = 0
+            self.names[env_idx] = [None] * self.max_n
             return
 
         pose_batch = [c.pose for c in cuboids]
@@ -253,7 +254,7 @@ class CuboidData:
         self.inv_pose[env_idx, :num_cuboids, :7] = cube_tensors[1]
         self.enable[env_idx, :num_cuboids] = 1
         self.enable[env_idx, num_cuboids:] = 0
-        self.names[env_idx][:num_cuboids] = names_batch
+        self.names[env_idx] = names_batch + [None] * (self.max_n - num_cuboids)
         self.count[env_idx] = num_cuboids
 
     def add(self, cuboid: Cuboid, env_idx: int = 0) -> int:
@@ -383,6 +384,10 @@ class CuboidData:
     # -------------------------------------------------------------------------
     # Query Methods
     # -------------------------------------------------------------------------
+
+    def has_name(self, name: str, env_idx: int = 0) -> bool:
+        """Check whether a cuboid name is active in an environment."""
+        return name in self.names[env_idx]
 
     def get_idx(self, name: str, env_idx: int = 0) -> int:
         """Get the index of a cuboid by name.

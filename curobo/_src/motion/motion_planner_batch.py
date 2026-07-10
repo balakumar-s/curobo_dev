@@ -17,14 +17,15 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
+from curobo._src.collision.attachment_manager import AttachmentManager
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.geom.collision.collision_scene import create_scene_collision
-from curobo._src.robot.kinematics.kinematics import Kinematics
-from curobo._src.robot.kinematics.kinematics_state import KinematicsState
 from curobo._src.geom.types import SceneCfg
 from curobo._src.motion.motion_planner import _axis_string_to_vector
 from curobo._src.motion.motion_planner_cfg import MotionPlannerCfg
 from curobo._src.motion.motion_planner_result import GraspPlanResult
+from curobo._src.robot.kinematics.kinematics import Kinematics
+from curobo._src.robot.kinematics.kinematics_state import KinematicsState
 from curobo._src.solver.solver_ik import IKSolver
 from curobo._src.solver.solver_trajopt import TrajOptSolver
 from curobo._src.solver.solver_trajopt_result import TrajOptSolverResult
@@ -96,9 +97,9 @@ class BatchMotionPlanner:
         return False
 
     @property
-    def attachment_manager(self):
+    def attachment_manager(self) -> AttachmentManager:
         """Attachment manager for attaching/detaching obstacles to robot links."""
-        return self.trajopt_solver.attachment_manager
+        return self.trajopt_solver.core.attachment_manager
 
     @property
     def batch_size(self) -> int:
@@ -111,7 +112,7 @@ class BatchMotionPlanner:
 
         Args:
             enable_graph: Warmup graph planner if available (multi_env=False).
-            num_warmup_iterations: Number of dummy solves.
+            num_warmup_iterations: Number of dummy c-space and pose solves.
         """
         og_exit_early = self.ik_solver.config.exit_early
         self.ik_solver.config.exit_early = False
@@ -128,6 +129,8 @@ class BatchMotionPlanner:
             goal_state.position[..., 0] += 0.2
 
             self.plan_cspace(goal_state, current_state)
+            goal_tool_poses = self.compute_kinematics(goal_state).tool_poses.as_goal()
+            self.plan_pose(goal_tool_poses, current_state)
             self.reset_seed()
 
         if enable_graph and self.graph_planner is not None:
@@ -144,6 +147,11 @@ class BatchMotionPlanner:
         max_attempts: int = 1,
         success_ratio: float = 1.0,
         enable_graph_attempt: int = 0,
+        finetune_attempts: int = 1,
+        initial_iters: Optional[int] = None,
+        time_optimal_iters: Optional[int] = None,
+        finetune_iters: Optional[int] = None,
+        finetune_dt_scale: float = 0.55,
     ) -> Optional[TrajOptSolverResult]:
         """Plan trajectories for a batch of pose targets.
 
@@ -162,6 +170,16 @@ class BatchMotionPlanner:
                 succeeded (0.0-1.0).  Default 1.0 means wait for all.
             enable_graph_attempt: Attempt index at which to start graph
                 seeding (when graph planner is available).
+            finetune_attempts: Number of additional time-optimal refinement
+                passes after the initial solve.
+            initial_iters: Optional optimizer iteration override for the
+                initial solve.
+            time_optimal_iters: Optional optimizer iteration override for the
+                first refinement pass.
+            finetune_iters: Optional optimizer iteration override for later
+                refinement passes.
+            finetune_dt_scale: Multiplicative factor applied to the trajectory
+                timestep between refinement passes.
 
         Returns:
             TrajOptSolverResult with per-problem success, or None if IK
@@ -201,6 +219,11 @@ class BatchMotionPlanner:
                 seed_config=ik_result.solution,
                 seed_traj=seed_traj,
                 use_implicit_goal=use_implicit_goal,
+                finetune_attempts=finetune_attempts,
+                initial_iters=initial_iters,
+                time_optimal_iters=time_optimal_iters,
+                finetune_iters=finetune_iters,
+                finetune_dt_scale=finetune_dt_scale,
             )
             total_time += trajopt_result.total_time
 

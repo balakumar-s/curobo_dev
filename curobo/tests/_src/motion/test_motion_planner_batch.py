@@ -35,6 +35,27 @@ class TestBatchMotionPlannerInit:
         )
         planner = BatchMotionPlanner(config)
         assert planner.batch_size == 4
+        assert planner.ik_solver.config.num_seeds == 16
+        assert planner.trajopt_solver.config.num_seeds == 2
+        assert config.ik_solver_config.num_seeds == 16
+        assert config.trajopt_solver_config.num_seeds == 2
+        assert planner.config is config
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_init_preserves_explicit_seed_counts(self, cuda_device_cfg) -> None:
+        config = MotionPlannerCfg.create(
+            robot="franka.yml",
+            device_cfg=cuda_device_cfg,
+            max_batch_size=4,
+            num_ik_seeds=32,
+            num_trajopt_seeds=4,
+            use_cuda_graph=False,
+        )
+
+        planner = BatchMotionPlanner(config)
+
+        assert planner.ik_solver.config.num_seeds == 32
+        assert planner.trajopt_solver.config.num_seeds == 4
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_has_graph_planner_when_shared_env(self, cuda_device_cfg):
@@ -63,6 +84,23 @@ class TestBatchMotionPlannerInit:
 
 class TestBatchMotionPlannerProperties:
     """Test BatchMotionPlanner properties."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_attachment_manager(self, cuda_device_cfg) -> None:
+        config = MotionPlannerCfg.create(
+            robot="franka.yml",
+            device_cfg=cuda_device_cfg,
+            max_batch_size=2,
+            use_cuda_graph=False,
+        )
+        planner = BatchMotionPlanner(config)
+        attachment_manager = planner.attachment_manager
+
+        assert attachment_manager is planner.trajopt_solver.core.attachment_manager
+        assert (
+            attachment_manager.kinematics_params
+            is planner.ik_solver.core.attachment_manager.kinematics_params
+        )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_joint_names(self, cuda_device_cfg):
@@ -161,7 +199,7 @@ class TestBatchMotionPlannerPlanPose:
             assert result.success.shape[0] == batch_size
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_plan_pose_with_max_attempts(self, cuda_device_cfg):
+    def test_plan_pose_with_trajopt_options(self, cuda_device_cfg):
         batch_size = 2
         config = MotionPlannerCfg.create(
             robot="franka.yml",
@@ -174,23 +212,23 @@ class TestBatchMotionPlannerPlanPose:
         start = planner.default_joint_state.position.unsqueeze(0).repeat(batch_size, 1)
         current_states = JointState.from_position(start, joint_names=planner.joint_names)
 
-        tool_frames = planner.tool_frames
-        position = torch.tensor([[0.4, 0.0, 0.4]], **cuda_device_cfg.as_torch_dict())
-        position = position.repeat(batch_size, 1)
-        quaternion = torch.tensor([[1.0, 0.0, 0.0, 0.0]], **cuda_device_cfg.as_torch_dict())
-        quaternion = quaternion.repeat(batch_size, 1)
-        goal_tool_poses = GoalToolPose.from_poses(
-            {tool_frames[0]: Pose(position=position, quaternion=quaternion).unsqueeze(1)},
-            ordered_tool_frames=tool_frames,
-        )
+        goal_states = current_states.clone()
+        goal_states.position[..., 0] += 0.1
+        goal_tool_poses = planner.compute_kinematics(goal_states).tool_poses.as_goal()
 
         result = planner.plan_pose(
             goal_tool_poses=goal_tool_poses,
             current_state=current_states,
             max_attempts=3,
             success_ratio=0.5,
+            initial_iters=25,
+            time_optimal_iters=25,
+            finetune_iters=25,
+            finetune_attempts=2,
+            finetune_dt_scale=0.75,
         )
-        assert result is None or isinstance(result, TrajOptSolverResult)
+        assert isinstance(result, TrajOptSolverResult)
+        assert result.success.shape[0] == batch_size
 
 
 class TestBatchMotionPlannerPlanCspace:

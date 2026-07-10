@@ -25,6 +25,7 @@ from curobo._src.transition.robot_state_transition_cfg import (
 )
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.robot import RobotCfg
+from curobo._src.util.logging import log_and_raise
 from curobo._src.util.trajectory import TrajInterpolationType
 
 
@@ -73,8 +74,10 @@ class TrajOptSolverCfg:
     #: Interpolation method used to convert optimizer knots into a dense
     #: trajectory. B-spline knot interpolation via CUDA is the default.
     interpolation_type: TrajInterpolationType = TrajInterpolationType.BSPLINE_KNOTS_CUDA
-    #: Maximum number of waypoints in the interpolation output buffer.
-    interpolation_buffer_size: int = 5000
+    #: Maximum number of waypoints in the interpolation output buffer. Larger
+    #: values can significantly increase GPU memory usage because position,
+    #: velocity, acceleration, and jerk are allocated for each batched seed trajectory.
+    interpolation_buffer_size: int = 1000
 
     # Convenience accessors into core_cfg
     @property
@@ -141,6 +144,8 @@ class TrajOptSolverCfg:
         max_batch_size: int = 1,
         multi_env: bool = False,
         max_goalset: int = 1,
+        interpolation_dt: float = 0.025,
+        interpolation_buffer_size: int = 1000,
     ) -> TrajOptSolverCfg:
         """Create TrajOptSolverCfg from flexible inputs.
 
@@ -177,10 +182,21 @@ class TrajOptSolverCfg:
             max_batch_size: Maximum batch size.
             multi_env: Whether to use multi-env collision.
             max_goalset: Maximum goalset size.
+            interpolation_dt: Time step in seconds for the dense interpolated
+                trajectory. Larger values produce fewer waypoints.
+            interpolation_buffer_size: Maximum number of dense trajectory
+                waypoints to preallocate. Larger values can significantly
+                increase GPU memory usage because state buffers are allocated
+                for every batched seed trajectory.
 
         Returns:
             Configured TrajOptSolverCfg instance.
         """
+        if interpolation_dt <= 0.0:
+            log_and_raise("interpolation_dt must be greater than zero")
+        if interpolation_buffer_size <= 0:
+            log_and_raise("interpolation_buffer_size must be greater than zero")
+
         num_envs = max_batch_size if multi_env else 1
 
         # 1. Resolve YAML paths
@@ -235,5 +251,7 @@ class TrajOptSolverCfg:
             self_collision_check=self_collision_check,
             minimum_trajectory_dt=minimum_trajectory_dt,
             maximum_trajectory_dt=maximum_trajectory_dt,
+            interpolation_dt=interpolation_dt,
             interpolation_type=interpolation_type,
+            interpolation_buffer_size=interpolation_buffer_size,
         )

@@ -133,6 +133,23 @@ class TestIKSolverInitialization:
         solver = IKSolver(config)
         assert solver.seed_ik_solver is None
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_multi_link_ik_uses_additional_lm_seeds(self, cuda_device_cfg) -> None:
+        """Test two-link IK increases the LM seed count."""
+        config = IKSolverCfg.create(
+            robot="dual_ur10e.yml",
+            device_cfg=cuda_device_cfg,
+            num_seeds=32,
+            seed_solver_num_seeds=32,
+            use_cuda_graph=False,
+        )
+
+        solver = IKSolver(config)
+
+        assert len(solver.kinematics.tool_frames) == 2
+        assert solver.seed_ik_solver.config.num_seeds == 128
+        assert solver.seed_ik_solver.config.max_iterations == 20
+
 
 class TestIKSolverProperties:
     """Test IKSolver properties."""

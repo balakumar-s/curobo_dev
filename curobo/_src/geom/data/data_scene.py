@@ -70,6 +70,7 @@ class SceneData:
     # Factory Methods
     # -------------------------------------------------------------------------
     def get_valid_data(self) -> List[Union[CuboidData, MeshData, VoxelData]]:
+        """Return initialized type-specific obstacle storage."""
         valid_data = []
         if self.cuboids is not None:
             valid_data.append(self.cuboids)
@@ -78,6 +79,15 @@ class SceneData:
         if self.voxels is not None:
             valid_data.append(self.voxels)
         return valid_data
+
+    def _get_obstacle_data(
+        self, name: str, env_idx: int
+    ) -> Optional[Union[CuboidData, MeshData, VoxelData]]:
+        """Find the type-specific storage containing an obstacle."""
+        for obstacle_data in self.get_valid_data():
+            if obstacle_data.has_name(name, env_idx):
+                return obstacle_data
+        return None
 
     @classmethod
     def create_cache(
@@ -319,28 +329,10 @@ class SceneData:
         Raises:
             ValueError: If obstacle not found in any type.
         """
-        if self.cuboids is not None:
-            try:
-                self.cuboids.update_pose(name, w_obj_pose=pose, env_idx=env_idx)
-                return
-            except RuntimeError:
-                pass
-
-        if self.meshes is not None:
-            try:
-                self.meshes.update_pose(name, w_obj_pose=pose, env_idx=env_idx)
-                return
-            except RuntimeError:
-                pass
-
-        if self.voxels is not None:
-            try:
-                self.voxels.update_pose(name, w_obj_pose=pose, env_idx=env_idx)
-                return
-            except RuntimeError:
-                pass
-
-        log_and_raise(f"Obstacle '{name}' not found in environment {env_idx}")
+        obstacle_data = self._get_obstacle_data(name, env_idx)
+        if obstacle_data is None:
+            log_and_raise(f"Obstacle '{name}' not found in environment {env_idx}")
+        obstacle_data.update_pose(name, w_obj_pose=pose, env_idx=env_idx)
 
     def enable_obstacle(
         self,
@@ -358,28 +350,10 @@ class SceneData:
         Raises:
             ValueError: If obstacle not found in any type.
         """
-        if self.cuboids is not None:
-            try:
-                self.cuboids.set_enabled(name, enabled, env_idx)
-                return
-            except RuntimeError:
-                pass
-
-        if self.meshes is not None:
-            try:
-                self.meshes.set_enabled(name, enabled, env_idx)
-                return
-            except RuntimeError:
-                pass
-
-        if self.voxels is not None:
-            try:
-                self.voxels.set_enabled(name, enabled, env_idx)
-                return
-            except RuntimeError:
-                pass
-
-        log_and_raise(f"Obstacle '{name}' not found in environment {env_idx}")
+        obstacle_data = self._get_obstacle_data(name, env_idx)
+        if obstacle_data is None:
+            log_and_raise(f"Obstacle '{name}' not found in environment {env_idx}")
+        obstacle_data.set_enabled(name, enabled, env_idx)
 
     def get_obstacle_names(self, env_idx: int = 0) -> List[str]:
         """Get names of all obstacles in an environment.
@@ -401,7 +375,7 @@ class SceneData:
 
     def check_obstacle_exists(self, name: str, env_idx: int = 0) -> bool:
         """Check if an obstacle exists in the scene."""
-        return name in self.get_obstacle_names(env_idx)
+        return self._get_obstacle_data(name, env_idx) is not None
 
     def clear(self, env_idx: Optional[int] = None) -> None:
         """Clear all obstacles from one or all environments.

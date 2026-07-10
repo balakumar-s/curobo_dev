@@ -154,6 +154,45 @@ class TestMotionPlannerCfgCreateMethod:
         assert config.trajopt_solver_config.num_seeds == 8
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_create_sets_interpolation_config(self, cuda_device_cfg) -> None:
+        """Test interpolation settings are forwarded to TrajOpt."""
+        config = MotionPlannerCfg.create(
+            robot="franka.yml",
+            device_cfg=cuda_device_cfg,
+            interpolation_dt=0.05,
+            interpolation_buffer_size=2048,
+            use_cuda_graph=False,
+        )
+
+        assert config.trajopt_solver_config.interpolation_dt == 0.05
+        assert config.trajopt_solver_config.interpolation_buffer_size == 2048
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_create_uses_single_problem_seed_defaults(self, cuda_device_cfg):
+        """Test create uses the standard seed defaults for one problem."""
+        config = MotionPlannerCfg.create(
+            robot="franka.yml",
+            device_cfg=cuda_device_cfg,
+            use_cuda_graph=False,
+        )
+
+        assert config.ik_solver_config.num_seeds == 32
+        assert config.trajopt_solver_config.num_seeds == 4
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_create_uses_batch_seed_defaults(self, cuda_device_cfg):
+        """Test create reduces default seed counts for batched problems."""
+        config = MotionPlannerCfg.create(
+            robot="franka.yml",
+            device_cfg=cuda_device_cfg,
+            max_batch_size=4,
+            use_cuda_graph=False,
+        )
+
+        assert config.ik_solver_config.num_seeds == 16
+        assert config.trajopt_solver_config.num_seeds == 2
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_create_sets_position_tolerance(self, cuda_device_cfg):
         """Test create sets position_tolerance correctly."""
         config = MotionPlannerCfg.create(
@@ -227,13 +266,13 @@ class TestMotionPlannerCfgDefaults:
         """Test default num_ik_seeds parameter in create."""
         import inspect
         sig = inspect.signature(MotionPlannerCfg.create)
-        assert sig.parameters["num_ik_seeds"].default == 32
+        assert sig.parameters["num_ik_seeds"].default is None
 
     def test_default_num_trajopt_seeds_parameter(self):
         """Test default num_trajopt_seeds parameter in create."""
         import inspect
         sig = inspect.signature(MotionPlannerCfg.create)
-        assert sig.parameters["num_trajopt_seeds"].default == 4
+        assert sig.parameters["num_trajopt_seeds"].default is None
 
     def test_default_position_tolerance_parameter(self):
         """Test default position_tolerance parameter in create."""

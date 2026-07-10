@@ -73,6 +73,17 @@
   reference example with Franka MPC using a RealSense backend.
 
 ### Bug Fixes & Misc.
+- Reduce GPU memory consumption for batched motion planning by 3x with
+  batch-aware IK and TrajOpt seed defaults and a smaller interpolation buffer.
+- Fix `MotionPlanner` and `BatchMotionPlanner` attachment-manager access so
+  attached collision geometry is shared correctly across IK and TrajOpt.
+- Fix batch-planner warmup to exercise both pose and c-space planning and
+  correctly forward TrajOpt refinement settings.
+- Fix scene obstacle pose and enable updates to use name-based routing without
+  swallowing runtime errors or synchronizing GPU obstacle counts.
+- Make TrajOpt interpolation capacity configurable through `MotionPlannerCfg`
+  and report how to adjust buffer size or interpolation timestep when capacity
+  is exceeded.
 - Fix B-spline MPC command extraction to skip the start-boundary support window.
 - Keep TrajOpt c-space solves on implicit seed goals to avoid changing goal-buffer
   structure when alternating with pose planning under CUDA graphs.

@@ -282,7 +282,7 @@ class TestTrajOptSolverProperties2:
         """Test interpolation_steps property."""
         steps = trajopt_solver.interpolation_steps
         assert isinstance(steps, int)
-        assert steps > 0
+        assert steps == 4
 
 
 class TestTrajOptSolverResultFromSolve:
@@ -571,6 +571,32 @@ class TestTrajOptSolverSolveCspace:
     def test_solve_cspace_method_exists(self, trajopt_solver):
         assert hasattr(trajopt_solver, 'solve_cspace')
         assert callable(trajopt_solver.solve_cspace)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_interpolation_buffer_error_is_actionable(self, cuda_device_cfg) -> None:
+        """Test an undersized interpolation buffer reports both remedies."""
+        config = TrajOptSolverCfg.create(
+            robot="franka.yml",
+            device_cfg=cuda_device_cfg,
+            num_seeds=1,
+            interpolation_buffer_size=1,
+            use_cuda_graph=False,
+        )
+        solver = TrajOptSolver(config)
+        current_state = JointState.from_position(
+            solver.default_joint_state.position.unsqueeze(0),
+            joint_names=solver.joint_names,
+        )
+        goal_state = current_state.clone()
+        goal_state.position[..., 0] += 0.1
+
+        with pytest.raises(ValueError) as error:
+            solver.solve_cspace(goal_state=goal_state, current_state=current_state)
+
+        message = str(error.value)
+        assert "interpolation_buffer_size=1" in message
+        assert "larger interpolation_buffer_size or interpolation_dt" in message
+        assert "significantly increase GPU memory usage" in message
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_solve_cspace_uses_implicit_seed_goal(

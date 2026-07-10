@@ -163,6 +163,16 @@ class TestMotionPlannerProperties:
     """Test MotionPlanner properties."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_attachment_manager_property(self, motion_planner: MotionPlanner) -> None:
+        """Test the exposed attachment manager updates shared solver spheres."""
+        manager = motion_planner.attachment_manager
+        assert manager is motion_planner.trajopt_solver.core.attachment_manager
+        assert (
+            manager.kinematics_params
+            is motion_planner.ik_solver.core.attachment_manager.kinematics_params
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_joint_names_property(self, motion_planner):
         """Test joint_names property returns list of names."""
         names = motion_planner.joint_names

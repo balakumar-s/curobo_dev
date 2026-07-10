@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
+from curobo._src.collision.attachment_manager import AttachmentManager
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.geom.collision.collision_scene import create_scene_collision
 from curobo._src.geom.types import SceneCfg
@@ -101,9 +102,9 @@ class MotionPlanner:
         return False
 
     @property
-    def attachment_manager(self):
+    def attachment_manager(self) -> AttachmentManager:
         """Attachment manager for attaching/detaching obstacles to robot links."""
-        return self.trajopt_solver.attachment_manager
+        return self.trajopt_solver.core.attachment_manager
 
     # -- Properties --
 

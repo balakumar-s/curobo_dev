@@ -53,8 +53,8 @@ class MotionPlannerCfg:
         collision_cache: Optional[Dict[str, int]] = None,
         self_collision_check: bool = True,
         device_cfg: DeviceCfg = DeviceCfg(),
-        num_ik_seeds: int = 32,
-        num_trajopt_seeds: int = 4,
+        num_ik_seeds: Optional[int] = None,
+        num_trajopt_seeds: Optional[int] = None,
         position_tolerance: float = 0.005,
         orientation_tolerance: float = 0.05,
         use_cuda_graph: bool = True,
@@ -68,6 +68,8 @@ class MotionPlannerCfg:
         max_batch_size: int = 1,
         multi_env: bool = False,
         max_goalset: int = 1,
+        interpolation_dt: float = 0.025,
+        interpolation_buffer_size: int = 1000,
     ) -> MotionPlannerCfg:
         """Create a MotionPlannerCfg from robot, task, and scene configs.
 
@@ -110,16 +112,12 @@ class MotionPlannerCfg:
             self_collision_check: Enable robot self-collision costs/checks in
                 IK, TrajOpt, and graph planner validation.
             device_cfg: Tensor device and dtype configuration.
-            num_ik_seeds: Number of IK seeds evaluated per problem. A value
-                of 16 is good for most single-tool planning problems; increase
-                to 32 when more IK diversity is needed. Increasing beyond 32
-                usually does not help unless solving multi-tool IK/planning
-                problems.
+            num_ik_seeds: Number of IK seeds evaluated per problem. ``None``
+                uses 32 when ``max_batch_size`` is 1 and 16 for larger batch
+                capacities.
             num_trajopt_seeds: Number of trajectory optimization seeds.
-                MotionPlanner asks IK to return this many solutions to seed
-                TrajOpt. The default of 4 is recommended; using more than 4
-                typically does not improve solution quality and can
-                significantly increase planning time.
+                ``None`` uses 4 when ``max_batch_size`` is 1 and 2 for larger
+                batch capacities.
             position_tolerance: Cartesian position tolerance in meters used
                 for IK and TrajOpt success.
             orientation_tolerance: Cartesian orientation tolerance in radians
@@ -158,11 +156,23 @@ class MotionPlannerCfg:
                 is skipped in this mode.
             max_goalset: Maximum number of alternative goal poses per problem.
                 Smaller goalsets are padded internally.
+            interpolation_dt: Time step in seconds for the dense trajectory
+                returned by TrajOpt. Larger values produce fewer waypoints.
+            interpolation_buffer_size: Maximum number of dense trajectory
+                waypoints preallocated by TrajOpt. Increase this when using a
+                smaller ``interpolation_dt`` or longer trajectories. Larger
+                buffers can significantly increase GPU memory usage because
+                state buffers are allocated for every batched seed trajectory.
 
         Returns:
             MotionPlannerCfg containing IK, TrajOpt, graph planner, and
             optional scene collision configuration.
         """
+        if num_ik_seeds is None:
+            num_ik_seeds = 16 if max_batch_size > 1 else 32
+        if num_trajopt_seeds is None:
+            num_trajopt_seeds = 2 if max_batch_size > 1 else 4
+
         num_envs = max_batch_size if multi_env else 1
 
         # Resolve robot config
@@ -228,6 +238,8 @@ class MotionPlannerCfg:
             metrics_rollout=metrics_rollout,
             device_cfg=device_cfg,
             num_seeds=num_trajopt_seeds,
+            interpolation_dt=interpolation_dt,
+            interpolation_buffer_size=interpolation_buffer_size,
             position_tolerance=position_tolerance,
             orientation_tolerance=orientation_tolerance,
             use_cuda_graph=use_cuda_graph,
