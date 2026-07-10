@@ -304,6 +304,7 @@ class MeshData:
         if num_meshes == 0:
             self.enable[env_idx, :] = 0
             self.count[env_idx] = 0
+            self.names[env_idx] = [None] * self.max_n
             return
 
         name_list = []
@@ -330,7 +331,7 @@ class MeshData:
         self.inv_pose[env_idx, :num_meshes, :7] = inv_pose_buffer.get_pose_vector()
         self.enable[env_idx, :num_meshes] = 1
         self.enable[env_idx, num_meshes:] = 0
-        self.names[env_idx][:num_meshes] = name_list
+        self.names[env_idx] = name_list + [None] * (self.max_n - num_meshes)
         self.count[env_idx] = num_meshes
 
     def add(self, mesh: Mesh, env_idx: int = 0) -> int:
@@ -448,6 +449,10 @@ class MeshData:
     # -------------------------------------------------------------------------
     # Query Methods
     # -------------------------------------------------------------------------
+
+    def has_name(self, name: str, env_idx: int = 0) -> bool:
+        """Check whether a mesh name is active in an environment."""
+        return name in self.names[env_idx]
 
     def get_idx(self, name: str, env_idx: int = 0) -> int:
         """Get the index of a mesh by name."""

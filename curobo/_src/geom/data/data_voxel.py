@@ -417,6 +417,7 @@ class VoxelData:
         if num_voxels == 0:
             self.enable[env_idx, :] = 0
             self.count[env_idx] = 0
+            self.names[env_idx] = [None] * self.max_n
             return
 
         pose_batch = [v.pose for v in voxel_grids]
@@ -445,7 +446,7 @@ class VoxelData:
         self.inv_pose[env_idx, :num_voxels, :7] = b_T_w.get_pose_vector()
         self.enable[env_idx, :num_voxels] = 1
         self.enable[env_idx, num_voxels:] = 0
-        self.names[env_idx][:num_voxels] = names_batch
+        self.names[env_idx] = names_batch + [None] * (self.max_n - num_voxels)
         self.count[env_idx] = num_voxels
 
 
@@ -565,6 +566,10 @@ class VoxelData:
     # -------------------------------------------------------------------------
     # Query Methods
     # -------------------------------------------------------------------------
+
+    def has_name(self, name: str, env_idx: int = 0) -> bool:
+        """Check whether a voxel-grid name is active in an environment."""
+        return name in self.names[env_idx]
 
     def get_idx(self, name: str, env_idx: int = 0) -> int:
         """Get the index of a voxel grid by name."""

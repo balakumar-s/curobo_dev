@@ -72,6 +72,28 @@ class TestTrajOptSolverCfgDataclassAttributes:
         assert hasattr(config, "interpolation_type")
         assert isinstance(config.interpolation_type, TrajInterpolationType)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_default_interpolation_buffer_size(self, cuda_device_cfg) -> None:
+        """Test the default interpolation output buffer is bounded."""
+        config = TrajOptSolverCfg.create(
+            robot="franka.yml",
+            device_cfg=cuda_device_cfg,
+        )
+        assert config.interpolation_buffer_size == 1000
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_create_sets_interpolation_config(self, cuda_device_cfg) -> None:
+        """Test create accepts dense trajectory interpolation settings."""
+        config = TrajOptSolverCfg.create(
+            robot="franka.yml",
+            device_cfg=cuda_device_cfg,
+            interpolation_dt=0.05,
+            interpolation_buffer_size=2048,
+        )
+
+        assert config.interpolation_dt == 0.05
+        assert config.interpolation_buffer_size == 2048
+
 
 class TestTrajOptSolverCfgCreate:
     """Test TrajOptSolverCfg.create factory method."""
@@ -121,7 +143,7 @@ class TestTrajOptSolverCfgCreate:
             robot="franka.yml",
             device_cfg=cuda_device_cfg,
         )
-        assert config.num_seeds == 4  # TrajOpt default
+        assert config.num_seeds == 4
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_create_sets_position_tolerance(self, cuda_device_cfg):
@@ -315,4 +337,3 @@ class TestTrajOptSolverCfgCommonFields:
             optimizer_collision_activation_distance=0.02,
         )
         assert config.optimizer_collision_activation_distance == 0.02
-

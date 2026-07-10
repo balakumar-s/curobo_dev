@@ -31,8 +31,8 @@ from curobo._src.state.state_joint import JointState
 from curobo._src.types.control_space import ControlSpace
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
 from curobo._src.util.cuda_event_timer import CudaEventTimer
-from curobo._src.util.logging import log_and_raise, log_info, log_warn
-from curobo._src.util.torch_util import get_torch_jit_decorator, is_cuda_graph_reset_available
+from curobo._src.util.logging import log_and_raise, log_warn
+from curobo._src.util.torch_util import get_torch_jit_decorator
 from curobo._src.util.trajectory import calculate_dt_no_clamp, get_batch_interpolated_trajectory
 from curobo._src.util.trajectory_seed_generator import TrajectorySeedGenerator
 
@@ -624,14 +624,18 @@ class TrajOptSolver:
         )
 
         if state.shape != self._interpolated_traj_buffer.shape:
-            interpolation_buffer_reallocated = True
-            if is_cuda_graph_reset_available():
-                log_info("Interpolated trajectory buffer was recreated, reinitializing cuda graph")
-                self._interpolated_traj_buffer = state.clone()
-            else:
-                log_and_raise(
-                    "Interpolated trajectory buffer was recreated, but cuda graph is not available"
-                )
+            required_waypoints = state.shape[1]
+            log_and_raise(
+                f"Interpolated trajectory requires {required_waypoints} waypoints, exceeding "
+                f"interpolation_buffer_size={self.config.interpolation_buffer_size}. Recreate "
+                "the configuration with a larger interpolation_buffer_size or "
+                "interpolation_dt. "
+                "A larger interpolation_dt produces fewer waypoints. Increasing "
+                "interpolation_buffer_size can significantly increase GPU memory usage "
+                "because "
+                "position, velocity, acceleration, and jerk buffers are allocated for every "
+                "batched seed trajectory."
+            )
         return state, last_tstep, interpolation_buffer_reallocated
 
     @profiler.record_function("trajopt_solver/compute_trajectory_dt")
